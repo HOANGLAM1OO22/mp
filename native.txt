@@ -1,0 +1,103 @@
+To write a proper unit test for the BeepRemover class in Android, you should keep in mind that:
+
+You cannot directly test native code using a pure unit test (i.e., in the test folder using JUnit), because native code needs the Android runtime.
+
+Instead, you should use instrumented tests (in the androidTest folder), which run on a device or emulator and have access to Android components and the native library.
+
+However, for demonstration, I’ll show you both:
+
+A basic JUnit structure (for mocking and testing method calls),
+
+And mention how you'd properly write an instrumented test if you need to load the native library.
+
+
+
+package com.example.nativeapp;
+
+import android.content.Context;
+
+import androidx.test.platform.app.InstrumentationRegistry;
+import androidx.test.ext.junit.runners.AndroidJUnit4;
+
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+
+@RunWith(AndroidJUnit4.class)
+public class BeepRemoverInstrumentedTest {
+
+    private Context mContext;
+    private BeepRemover beepRemover;
+
+    @Before
+    public void setUp() {
+        mContext = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        beepRemover = new BeepRemover(mContext);
+    }
+
+    @Test
+    public void testInit() {
+        beepRemover.init(); // This will call initNative()
+    }
+
+    @Test
+    public void testRun() {
+        beepRemover.run(); // This will call runNative()
+    }
+
+    @Test
+    public void testRelease() {
+        beepRemover.release(); // This will call releaseNative()
+    }
+}
+
+
+dependencies {
+
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.constraintlayout
+    testImplementation libs.junit
+    androidTestImplementation libs.ext.junit
+    androidTestImplementation libs.espresso.core
+
+    testImplementation libs.core
+
+    testImplementation libs.mockito.core
+
+    testImplementation libs.mockito.kotlin
+    testImplementation libs.mockk
+
+}
+
+
+
+[versions]
+agp = "8.6.1"
+core = "1.6.1"
+junit = "4.13.2"
+junitVersion = "1.2.1"
+espressoCore = "3.6.1"
+appcompat = "1.7.0"
+material = "1.12.0"
+constraintlayout = "2.2.1"
+mockitoCore = "5.16.1"
+mockitoKotlin = "5.4.0"
+mockk = "5.16.1"
+
+[libraries]
+core = { module = "androidx.test:core", version.ref = "core" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
+mockito-core = { module = "org.mockito:mockito-core", version.ref = "mockitoCore" }
+mockito-kotlin = { module = "org.mockito.kotlin:mockito-kotlin", version.ref = "mockitoKotlin" }
+mockk = { module = "io.mockk:mockk", version.ref = "mockk" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+
+
