@@ -1,0 +1,381 @@
+Excellent — this is exactly the kind of code review task that a senior engineer would do with reference to *Robert C. Martin’s* **Clean Code** principles.
+Below is a **line-by-line review with inline comments and a summary for each code block (1 → 5)**.
+I’ll use ✅ (good), ⚠️ (minor issue), ❌ (problem), and 💡 (improvement suggestion).
+
+---
+
+## 🧩 **Code 1 — `Practice.BubbleSorter`**
+
+```java
+package Practice; // ⚠️ Package names should be lowercase per Java convention (e.g., 'practice')
+```
+
+```java
+private double[] mArray = {}; // ⚠️ Avoid Hungarian notation (mArray). Use descriptive name like 'numbers' or 'array'
+```
+
+```java
+public BubbleSorter(double[] array) {
+    setArray(array); // ✅ Constructor delegates initialization to setter (OK)
+}
+```
+
+```java
+public void setArray(double[] newArray) {
+    this.mArray = newArray; // ⚠️ No validation (e.g., null/empty check)
+}
+```
+
+```java
+public void printArray() {
+    for (double num : mArray) {
+        System.out.print(num + " "); // ⚠️ IO inside core logic — violates SRP (separation of concerns)
+    }
+    System.out.println();
+}
+```
+
+```java
+public void startSort() {
+    printArray(); // ⚠️ Logging/printing should not be coupled to sorting
+    sortArray();  // ✅ Sorting delegated to private method
+    printArray();
+}
+```
+
+```java
+private void sortArray() {
+    int arrayLength = mArray.length; // ✅ clear naming
+    boolean isSwapped;
+```
+
+```java
+for (int currentPass = 0; currentPass < arrayLength - 1; currentPass++) {
+    isSwapped = false; // ✅ Early-exit optimization available below
+```
+
+```java
+for (int currentIndex = 0; currentIndex < arrayLength - currentPass - 1; currentIndex++) {
+    if (shouldSwap(currentIndex)) { // ✅ clear naming
+        swap(currentIndex, currentIndex + 1);
+        isSwapped = true;
+    }
+}
+```
+
+```java
+if (!isSwapped) {
+    break; // ✅ early termination optimization
+}
+```
+
+```java
+private boolean shouldSwap(int index) {
+    return mArray[index] > mArray[index + 1]; // ✅ clear logic
+}
+```
+
+```java
+private void swap(int currentIndex, int nextIndex) {
+    double temp = mArray[currentIndex]; // ✅ simple and correct swap
+    mArray[currentIndex] = mArray[nextIndex];
+    mArray[nextIndex] = temp;
+}
+```
+
+### **Summary (Code 1)**
+
+✅ **Pros:**
+
+* Clear structure & separation of helper functions.
+* Implements early exit (`isSwapped`) optimization.
+* Simple & easy to understand.
+
+❌ **Cons / Improvements:**
+
+* Package and variable naming violate conventions (`Practice`, `mArray`).
+* No validation for null/empty input.
+* Printing logic should be removed from sorting logic.
+* Hard-coded to `double[]` only → no generic support.
+* Missing unit tests or exception handling.
+
+💡 **Clean version suggestion:**
+→ Extract IO (printing) into another class, validate input, rename identifiers, make it generic `<T extends Comparable<T>>`.
+
+---
+
+## 🧩 **Code 2 — `cleancode3.bubblesort.BubbleSort`**
+
+```java
+public static final String ASCENDING_SORT = "ascending";
+public static final String DESCENDING_SORT = "descending"; // ✅ clear constants; could use enum instead
+```
+
+```java
+public static void bubbleSort(int[] array, String sortOrder) {
+    isValidSortOrder(sortOrder); // ⚠️ Method name implies validation but it throws → rename to 'validateSortOrder'
+```
+
+```java
+boolean elementsSwapped;
+for (int currentPass = 0; currentPass < arraySize - 1; currentPass++) {
+    elementsSwapped = false; // ✅ reuse of early-exit optimization
+```
+
+```java
+if (compareAndSwap(array, currentIndex, sortOrder)) {
+    elementsSwapped = true; // ✅ separation of comparison logic
+}
+```
+
+```java
+if (!elementsSwapped) break; // ✅ efficient
+```
+
+```java
+private static void isValidSortOrder(String sortOrder) {
+    if (sortOrder == null || !ASCENDING_SORT.equalsIgnoreCase(sortOrder) && !DESCENDING_SORT.equalsIgnoreCase(sortOrder)) {
+        throw new IllegalArgumentException("Invalid sort order..."); // ✅ clear error message
+    }
+}
+```
+
+```java
+private static boolean compareAndSwap(int[] array, int currentIndex, String sortOrder) {
+    if (ASCENDING_SORT.equalsIgnoreCase(sortOrder)) {
+        if (array[currentIndex] > array[currentIndex + 1]) { // ✅ correct comparison
+            swap(array, currentIndex);
+            return true;
+        }
+    } else if (DESCENDING_SORT.equalsIgnoreCase(sortOrder)) {
+        if (array[currentIndex] < array[currentIndex + 1]) {
+            swap(array, currentIndex);
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+```java
+private static void swap(int[] array, int currentIndex) { // ⚠️ Unclear method name — ‘swapAdjacent’ would be clearer
+    int temp = array[currentIndex];
+    array[currentIndex] = array[currentIndex + 1];
+    array[currentIndex + 1] = temp;
+}
+```
+
+### **Summary (Code 2)**
+
+✅ **Pros:**
+
+* Proper input validation.
+* Supports ascending and descending sorting.
+* Separation of comparison, swap, and validation logic.
+* Clean naming and good readability.
+
+❌ **Cons:**
+
+* `isValidSortOrder()` name misleading (throws exception → should be `validateSortOrder`).
+* Could use **enum** instead of string literals for safety.
+* No generic type; fixed to `int[]`.
+* No `null` array check.
+
+💡 **Good step toward Clean Code — structured, readable, single responsibility per method.**
+
+---
+
+## 🧩 **Code 3 — `cleancode3.bubblesort.BubbleSorter` (Generic-like)**
+
+```java
+public static final String ASCENDING = "ascending";
+public static final String DESCENDING = "descending"; // ✅ consistent constants
+```
+
+```java
+public static int[] bubbleSort(int[] array, String sortOrder) {
+    validateSortOrder(sortOrder); // ✅ validation before logic
+    boolean isSorted;
+    do {
+        isSorted = true; // ✅ clean do-while design instead of nested for
+        ...
+    } while (!isSorted);
+}
+```
+
+```java
+private static boolean shouldSwap(Number currentElement, Number nextElement, String sortOrder) {
+    if (sortOrder.equals(ASCENDING)) {
+        return currentElement.doubleValue() > nextElement.doubleValue(); // ✅ clean abstraction using Number
+    } else {
+        return currentElement.doubleValue() < nextElement.doubleValue();
+    }
+}
+```
+
+```java
+private static void swap(double[] array, int firstIndex, int secondIndex) { ... }
+private static void swap(int[] array, int firstIndex, int secondIndex) { ... } // ✅ Overloaded clean design
+```
+
+### **Summary (Code 3)**
+
+✅ **Pros:**
+
+* Works for both `int[]` and `double[]`.
+* Avoids code duplication using shared logic (`shouldSwap`).
+* Uses validation properly.
+* Separation of logic is clear.
+* Do-while loop ensures repeat until sorted — simpler control flow.
+
+❌ **Cons:**
+
+* Still uses `String` for sort order instead of enum.
+* Lacks handling of `null` arrays.
+* Slight duplication between two `bubbleSort` overloads.
+* Conversion `doubleValue()` may cause small precision issues for very large `long` values.
+
+💡 **Very close to Clean Code:** consistent naming, no side effects, low complexity.
+✅ **Best structured among the sorting codes.**
+
+---
+
+## 🧩 **Code 4 — `cleancode3.BubbleSort` (Interactive console)**
+
+```java
+Scanner scanner = new Scanner(System.in); // ⚠️ IO handling inside main is OK but should not mix with logic
+```
+
+```java
+public static void sort(int[] array, String directionOrder) {
+    int arrayLength = array.length;
+    String sortDirection = directionOrder.toLowerCase(); // ✅ normalization
+```
+
+```java
+performBubbleSortPass(array, sortDirection, arrayLength - i - 1); // ✅ extracted helper improves readability
+```
+
+```java
+private static boolean shouldSwapElements(int[] array, int index, String sortDirection) {
+    if (sortDirection.contains("ascend")) { // ⚠️ fragile — should be equalsIgnoreCase
+        return array[index] > array[index + 1];
+    } else {
+        return array[index] < array[index + 1];
+    }
+}
+```
+
+```java
+public static void sort(int[] array) {
+    sort(array, "ascending"); // ✅ overloaded default method
+}
+```
+
+```java
+private static boolean isValidDirection(String direction) {
+    return "ascending".equals(direction) || "descending".equals(direction); // ✅ validation
+}
+```
+
+```java
+private static void printArray(int[] array) {
+    for (...) System.out.print(...); // ⚠️ console logic — should be separated
+}
+```
+
+### **Summary (Code 4)**
+
+✅ **Pros:**
+
+* Clear, readable structure.
+* Separation into helper methods (`performBubbleSortPass`, `shouldSwapElements`).
+* Interactive user input handling with validation.
+* Simple overloaded default `sort()`.
+
+❌ **Cons:**
+
+* Mixes user interaction (IO) with sorting logic (violates SRP).
+* Weak comparison using `contains("ascend")` — unsafe.
+* No exception handling for invalid input (e.g., non-number).
+
+💡 **Better for learning/demo, not for production.**
+Should refactor into `Sorter` (logic) + `Main` (UI/CLI interaction).
+
+---
+
+## 🧩 **Code 5 — `cleancode1.fitnesse.testablehtml.TestableHtml`**
+
+```java
+private static final String TEST_ATTRIBUTE = "Test"; // ✅ Good constant naming
+private static final String TEARDOWN_ATTRIBUTE = "TearDown"; // ✅ consistent naming
+```
+
+```java
+public String testableHtml(PageData pageData, boolean includeSuiteSetup) throws Exception {
+    if (!isTestHtml(pageData)) {
+        return pageData.getHtml(); // ✅ clean early return
+    }
+```
+
+```java
+StringBuffer buffer = new StringBuffer(); // ⚠️ use StringBuilder instead (non-synchronized)
+appendSetupIncludes(wikiPage, includeSuiteSetup, buffer); // ✅ good method extraction
+appendContent(pageData, buffer);
+appendTeardownIncludes(wikiPage, includeSuiteSetup, buffer);
+```
+
+```java
+pageData.setContent(buffer.toString());
+return pageData.getHtml(); // ✅ single responsibility and good composition
+```
+
+```java
+private void appendSetupIncludes(...) { ... } // ✅ decomposed logic
+private void appendTeardownIncludes(...) { ... } // ✅ good symmetry between setup/teardown
+```
+
+```java
+private void appendInclude(StringBuffer buffer, String includeName, String pagePathName) throws Exception {
+    buffer.append(includeName).append(pagePathName).append("\n"); // ⚠️ could extract a small IncludeFormatter class
+}
+```
+
+```java
+private boolean isTestHtml(PageData pageData) throws Exception {
+    return pageData.hasAttribute(TEST_ATTRIBUTE); // ✅ single purpose check
+}
+```
+
+### **Summary (Code 5)**
+
+✅ **Pros:**
+
+* Excellent adherence to *Clean Code*: short, cohesive methods.
+* Consistent naming and separation of responsibilities.
+* Clear early returns.
+* Proper encapsulation of setup/teardown inclusion logic.
+
+⚠️ **Minor improvements:**
+
+* Replace `StringBuffer` with `StringBuilder`.
+* Reduce `throws Exception` → specify checked exceptions.
+* Consider dependency inversion for include formatting.
+
+💡 **Best overall code quality** — likely written with Clean Code mindset.
+
+---
+
+# 🧾 **Final Comparative Summary**
+
+| Code                                    | Strengths                                    | Weaknesses                       | Clean Code Grade |
+| --------------------------------------- | -------------------------------------------- | -------------------------------- | ---------------- |
+| **1 – Practice.BubbleSorter**           | Simple, readable                             | Naming, IO mixing, no validation | ⚠️ C             |
+| **2 – cleancode3.BubbleSort**           | Clear structure, validation, separation      | Hardcoded strings, fixed type    | ✅ B              |
+| **3 – cleancode3.BubbleSorter**         | Generic-like, clean control, no side effects | String enums, no null check      | 🌟 **A-**        |
+| **4 – cleancode3.BubbleSort (console)** | Interactive, modular helpers                 | SRP violation (UI + logic)       | ⚠️ C+            |
+| **5 – TestableHtml**                    | Excellent decomposition, consistent naming   | Minor modernizations             | 🌟 **A**         |
+
+---
+
+Would you like me to produce a **GitHub review-style markdown file** (with diff comments and summary sections) suitable for a pull request review description?
