@@ -1,0 +1,86 @@
+private fun makeConverter(task: VideoTranscodingTask): Operator {
+    val srcW = task.getVideoWidth()
+    val srcH = task.getVideoHeight()
+    val srcRot = task.getRotation()
+    val dstRot = task.getTranscodingRotation()
+    val needRotate = srcRot != dstRot
+
+    // --- step 1: compute size after rotation ---
+    val rotatedW = if (needRotate && (srcRot % 180 != 0)) srcH else srcW
+    val rotatedH = if (needRotate && (srcRot % 180 != 0)) srcW else srcH
+
+    // --- step 2: target encoder size ---
+    val targetW = task.getTranscodingVideoWidth()
+    val targetH = task.getTranscodingVideoHeight()
+
+    // --- step 3: uniform scale so resized >= target ---
+    val scale = maxOf(
+        targetW.toFloat() / rotatedW,
+        targetH.toFloat() / rotatedH
+    )
+    val scaledW = (rotatedW * scale).roundToInt().coerceAtLeast(targetW)
+    val scaledH = (rotatedH * scale).roundToInt().coerceAtLeast(targetH)
+
+    SLog.i(TAG, """makeConverter fixed:
+        | src=${srcW}x${srcH} rot=$srcRot → dstRot=$dstRot
+        | rotated=${rotatedW}x${rotatedH}
+        | scaled=${scaledW}x${scaledH}
+        | target=${targetW}x${targetH}
+    """.trimToOneLine())
+
+    val converters = mutableListOf<ImgpConverter>()
+    if (needRotate) converters += ImgpConverter(UniImgp.ofRotate())
+    if (scale != 1f) converters += ImgpConverter(UniImgp.ofResize())
+    converters += ImgpConverter(UniImgp.ofCrop())
+
+    return Operator { ibuf, obuf ->
+        var input = ibuf
+        var output = obuf
+
+        for ((index, converter) in converters.withIndex()) {
+            val last = index == converters.lastIndex
+            output = when (converter.imgpType) {
+
+                ImgpType.ROTATE -> MediaBuffer.newImageAlloc().apply {
+                    val newFmt = input.format.toMutableFormat()
+                        .setCols(rotatedW)
+                        .setRows(rotatedH)
+                        .setRotation(
+                            getCorrectionRotation(srcRot, dstRot)
+                        )
+                    setMediaFormat(newFmt)
+                    if (last && obuf.isNotEmpty) setData(obuf.getData()) else asSharable()
+                }.allocate().toMutable()
+
+                ImgpType.RESIZE -> MediaBuffer.newImageAlloc().apply {
+                    val newFmt = input.format.toMutableFormat()
+                        .setCols(scaledW)
+                        .setRows(scaledH)
+                    setMediaFormat(newFmt)
+                    if (last && obuf.isNotEmpty) setData(obuf.getData()) else asSharable()
+                }.allocateMutable()
+
+                ImgpType.CROP -> MediaBuffer.newImageAlloc().apply {
+                    val cropX = ((scaledW - targetW) / 2).coerceAtLeast(0)
+                    val cropY = ((scaledH - targetH) / 2).coerceAtLeast(0)
+                    val cropRect = Rect(
+                        cropX, cropY,
+                        cropX + targetW, cropY + targetH
+                    )
+                    val newFmt = input.format.toMutableFormat()
+                        .setCols(targetW)
+                        .setRows(targetH)
+                        .setCropRect(cropRect)
+                    setMediaFormat(newFmt)
+                    if (last && obuf.isNotEmpty) setData(obuf.getData()) else asSharable()
+                }.allocateMutable()
+
+                else -> throw UnsupportedOperationException()
+            }
+
+            SLog.i(TAG, "Stage=${converter.imgpType}  in=${input.format.cols}x${input.format.rows} → out=${output.format.cols}x${output.format.rows}")
+            input = converter.run(input, output)
+        }
+        output
+    }
+}
