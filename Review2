@@ -1,0 +1,368 @@
+tuyệt vời 👏 — bạn đang thực hành đúng tinh thần **Martin Clean Code**: không chỉ “chạy được” mà còn phải “đọc được – hiểu được – bảo trì được”.
+
+Dưới đây là bài **review chi tiết từng dòng và tổng kết từng bài code (code 1 → 5)**
+Mỗi bài mình sẽ:
+
+* ✅ đánh giá **ưu điểm / nhược điểm**
+* 💬 ghi chú chi tiết theo **Clean Code principles**
+* 🧮 **chấm điểm /100**
+* 🎯 tổng kết **đề xuất cải tiến**
+
+---
+
+## 🧱 **Code 1: `Practice.BubbleSorter`**
+
+```java
+package Practice;
+
+public class BubbleSorter {
+
+    private double[] mArray = {};   // ⚠️ Nên để final hoặc null check – khởi tạo {} gây nhầm là mảng rỗng.
+
+    public BubbleSorter(double[] array) {
+        setArray(array);            // ✅ tốt, tách setter giúp tái sử dụng
+    }
+
+    public void setArray(double[] newArray) {
+        this.mArray = newArray;     // ⚠️ chưa có null check
+    }
+
+    public void printArray() {
+        for (double num : mArray) { // ✅ rõ ràng, clean
+            System.out.print(num + " ");
+        }
+        System.out.println();
+    }
+
+    public void startSort() {
+        printArray();               // ⚠️ in ra input ở đây nên tách riêng — không nên logic lẫn IO
+        sortArray();
+        printArray();
+    }
+
+    private void sortArray() {
+        int arrayLength = mArray.length;
+        boolean isSwapped;
+
+        for (int currentPass = 0; currentPass < arrayLength - 1; currentPass++) {
+            isSwapped = false;
+
+            for (int currentIndex = 0; currentIndex < arrayLength - currentPass - 1; currentIndex++) {
+                if (shouldSwap(currentIndex)) {
+                    swap(currentIndex, currentIndex + 1);
+                    isSwapped = true;
+                }
+            }
+
+            if (!isSwapped) {       // ✅ early exit – optimization tốt
+                break;
+            }
+        }
+    }
+
+    private boolean shouldSwap(int index) {
+        return mArray[index] > mArray[index + 1]; // ✅ rõ ràng
+    }
+
+    private void swap(int currentIndex, int nextIndex) {
+        double temp = mArray[currentIndex];
+        mArray[currentIndex] = mArray[nextIndex];
+        mArray[nextIndex] = temp;
+    }
+
+    public static void main(String[] args) {
+        BubbleSorter sorter = new BubbleSorter(new double[] {5, 3, 8, 4, 6});
+        sorter.startSort();
+    }
+}
+```
+
+### 💬 Review tổng quát:
+
+✅ **Ưu điểm:**
+
+* Đặt tên rõ ràng, dễ đọc (`shouldSwap`, `sortArray`, `swap`)
+* Có **early exit** – giảm số vòng lặp thừa
+* Cấu trúc hàm nhỏ, dễ hiểu
+
+⚠️ **Nhược điểm:**
+
+* Không có xử lý **ascending/descending**
+* Không có **input validation** (null, mảng rỗng)
+* `startSort()` lẫn logic và IO → vi phạm **Single Responsibility**
+* Không có testable API (chỉ in ra console)
+* Không dùng constant cho “order” → magic logic
+
+🎯 **Điểm: 75/100**
+
+---
+
+## 🧱 **Code 2: `cleancode3.bubblesort.BubbleSort`**
+
+```java
+public static final String ASCENDING_SORT = "ascending";
+public static final String DESCENDING_SORT = "descending";  // ✅ tránh magic string
+```
+
+* ✅ Tốt: sử dụng constant giúp dễ bảo trì.
+
+```java
+isValidSortOrder(sortOrder); // ⚠️ tên sai, nên là validateSortOrder (chưa trả boolean)
+```
+
+* Hàm có side effect (throw exception) nhưng tên “isValid…” gợi ý boolean → ❌ không chuẩn semantic.
+
+```java
+if (!elementsSwapped) break; // ✅ optimization tốt
+```
+
+```java
+private static boolean compareAndSwap(int[] array, int currentIndex, String sortOrder) {
+    if (ASCENDING_SORT.equalsIgnoreCase(sortOrder)) {
+        if (array[currentIndex] > array[currentIndex + 1]) {
+            swap(array, currentIndex);
+            return true;
+        }
+```
+
+* ⚠️ Cấu trúc `if` lặp lại 2 nhánh gần giống nhau – nên trừu tượng hóa `shouldSwap` → DRY.
+
+```java
+private static void swap(int[] array, int currentIndex) {
+    int temp = array[currentIndex];
+    array[currentIndex] = array[currentIndex + 1];
+    array[currentIndex + 1] = temp;
+}
+```
+
+* ✅ đơn giản, đúng chức năng.
+
+### 💬 Tổng kết:
+
+✅ **Ưu điểm:**
+
+* Có hằng số `ASCENDING_SORT`, `DESCENDING_SORT`
+* Có input validation
+* Early exit `break`
+* Code tách nhỏ, rõ ràng
+
+⚠️ **Nhược điểm:**
+
+* Hàm `isValidSortOrder` đặt sai tên → **nên là** `validateSortOrder`
+* `compareAndSwap()` hơi rườm (if-else lặp)
+* Không clone array → **thay đổi dữ liệu gốc**
+* Main test không rõ output giữa lần 1 / lần 2 (sắp xếp lại cùng mảng)
+
+🎯 **Điểm: 85/100**
+
+---
+
+## 🧱 **Code 3: `cleancode3.bubblesort.BubbleSorter` + Main**
+
+✅ hỗ trợ cả `int[]` và `double[]`
+✅ sử dụng `Number` và **overload** – rất linh hoạt.
+
+```java
+validateSortOrder(sortOrder); // ✅ tốt
+```
+
+```java
+boolean isSorted;
+do {
+    isSorted = true;
+    for (...) {
+        if (shouldSwap(...)) {
+            swap(...);
+            isSorted = false;
+        }
+    }
+} while (!isSorted);
+```
+
+* ✅ cấu trúc rõ ràng, dễ hiểu
+* ⚠️ hiệu năng hơi kém hơn (vì luôn chạy thêm 1 vòng sau khi sorted)
+
+```java
+private static boolean shouldSwap(Number currentElement, Number nextElement, String sortOrder) {
+    if (sortOrder.equals(ASCENDING)) {
+        return currentElement.doubleValue() > nextElement.doubleValue();
+    } else {
+        return currentElement.doubleValue() < nextElement.doubleValue();
+    }
+}
+```
+
+* ✅ tái sử dụng cho cả `int[]`, `double[]`
+* ⚠️ `sortOrder.equals(ASCENDING)` → nên dùng `.equalsIgnoreCase`
+* ⚠️ chưa handle `null` input array
+
+### 💬 Tổng kết:
+
+✅ **Ưu điểm:**
+
+* Code sạch, rõ
+* Tách biệt logic và test (Main riêng)
+* Có thể mở rộng cho nhiều kiểu dữ liệu
+* Enum-like constants
+
+⚠️ **Nhược điểm:**
+
+* Hiệu năng chưa tối ưu (vòng do-while)
+* Không có null-check array
+* Dùng String thay vì enum `SortOrder`
+
+🎯 **Điểm: 90/100**
+
+---
+
+## 🧱 **Code 4: `cleancode3.BubbleSort` (với Scanner input)**
+
+✅ Đây là phiên bản hướng người dùng – có IO + validate nhập.
+
+```java
+String sortDirection = directionOrder.toLowerCase(); // ✅ normalize input
+```
+
+```java
+if (sortDirection.contains("ascend")) { ... } // ⚠️ không nên dùng contains → dễ lỗi
+```
+
+→ ví dụ `"descending"` cũng chứa `"ascend"` phần đầu, gây bug tiềm ẩn.
+
+```java
+System.out.println("Nhập các số trong mảng (cách nhau bằng dấu cách):");
+```
+
+✅ thân thiện người dùng, tuy nhiên:
+
+* ⚠️ lẫn IO và logic → khó test tự động
+* ⚠️ không clone array
+* ⚠️ class name trùng `BubbleSort` → dễ nhầm với version khác
+
+```java
+private static boolean isValidDirection(String direction) {
+    return "ascending".equals(direction) || "descending".equals(direction);
+}
+```
+
+✅ Rõ ràng, clean, dễ đọc.
+
+### 💬 Tổng kết:
+
+✅ **Ưu điểm:**
+
+* Có input validation, xử lý nhập sai
+* Code dễ hiểu cho người mới
+* Tách được các hàm nhỏ
+
+⚠️ **Nhược điểm:**
+
+* IO + logic trộn lẫn → vi phạm SRP
+* contains("ascend") bug logic
+* Không dùng enum hoặc constant
+* Không có early exit optimization
+
+🎯 **Điểm: 70/100**
+
+---
+
+## 🧱 **Code 5: `cleancode3.bubblesort.BubbleSort` (Factory + Abstract class)**
+
+👏 Đây là **thiết kế tốt nhất** trong 5 bài — gần chuẩn *Martin Clean Code + OOP design pattern*.
+
+```java
+BubbleSortFactory.createBubbleSortImp("ascending"); // ✅ Factory pattern đúng chuẩn
+```
+
+```java
+abstract class BubbleSortImp {
+    protected float[] mInputNumber;
+    ...
+    public void sortAndPrint(float[] inputNumber) { ... } // ✅ rõ ràng
+```
+
+```java
+public void sort() {
+    int number_count = mInputNumber.length;
+    for (int i = 0; i < number_count - 1; i++) {
+        if (!isSorted(number_count - i - 1)) {
+            break;
+        }
+    }
+}
+```
+
+* ✅ Có early exit
+* ⚠️ Tên `isSorted()` không đúng chức năng (thực ra là “performPass”)
+* ⚠️ Logic lặp giữa `ascending`/`descending` — tốt hơn dùng interface `Comparator<Float>`
+
+```java
+class BubbleSortAscending extends BubbleSortImp {
+    @Override
+    public boolean needSwap(int index) {
+        return mInputNumber[index] > mInputNumber[index + 1];
+    }
+}
+```
+
+✅ Rất clean — mỗi subclass chỉ định nghĩa điều kiện so sánh.
+
+### 💬 Tổng kết:
+
+✅ **Ưu điểm:**
+
+* Áp dụng **Factory + Template Method pattern**
+* Tách biệt rõ trách nhiệm: Factory / Base / Variant
+* Dễ mở rộng (có thể thêm “RandomSort”, “CustomSort”)
+* Có early exit tối ưu
+* In kết quả rõ ràng, có OOP cấu trúc tốt
+
+⚠️ **Nhược điểm:**
+
+* Tên hàm `isSorted()` gây hiểu lầm → nên đổi `performPass()`
+* Không có null-check
+* Chưa generic (`float[]` cố định)
+* Cần enum `SortOrder` thay vì string
+
+🎯 **Điểm: 95/100**
+
+---
+
+# 🏁 Tổng kết so sánh
+
+| Bài   | Mô tả ngắn              | Ưu điểm chính                 | Nhược điểm chính                     | Điểm   |
+| ----- | ----------------------- | ----------------------------- | ------------------------------------ | ------ |
+| **1** | Basic class, procedural | Clear functions, easy to read | Không có order, lẫn IO               | **75** |
+| **2** | Static clean version    | Có constants, early exit      | Hàm đặt tên sai, không clone         | **85** |
+| **3** | Generic kiểu dữ liệu    | Clean, overload, reusable     | Không tối ưu do-while                | **90** |
+| **4** | Có giao diện console    | Dễ dùng, có validation        | contains bug, lẫn IO                 | **70** |
+| **5** | OOP + Factory Pattern   | Chuẩn clean architecture      | Tên hàm chưa chính xác, chưa generic | **95** |
+
+---
+
+# 🧠 Tổng nhận xét theo **Martin Clean Code**
+
+| Principle                       | Code 1 | Code 2 | Code 3 | Code 4 | Code 5 |
+| ------------------------------- | ------ | ------ | ------ | ------ | ------ |
+| **Meaningful Names**            | ✅      | ✅      | ✅      | ✅      | ✅✅     |
+| **Small Functions**             | ✅      | ✅      | ✅✅     | ✅      | ✅✅     |
+| **SRP (Single Responsibility)** | ⚠️     | ✅      | ✅      | ❌      | ✅✅     |
+| **Avoid Duplication (DRY)**     | ✅      | ⚠️     | ✅      | ⚠️     | ✅      |
+| **Clarity over Cleverness**     | ✅      | ✅      | ✅      | ✅      | ✅      |
+| **Extensibility**               | ⚠️     | ⚠️     | ✅      | ❌      | ✅✅     |
+| **Error Handling**              | ⚠️     | ✅      | ⚠️     | ✅      | ✅      |
+
+---
+
+👉 **Gợi ý chung để đạt 100/100:**
+
+1. Dùng **Enum SortOrder** thay vì string
+2. Validate **null / empty** input
+3. Không in trực tiếp trong logic — tách riêng `printResult()` hoặc `Main`
+4. Thêm **unit test (JUnit)** thay vì `System.out`
+5. Dùng **Generic + Comparator<T>** để sort mọi kiểu (Integer, Double, String, etc.)
+
+---
+
+Nếu bạn muốn, mình có thể giúp viết **phiên bản 100/100 chuẩn Clean Code** (với Enum, Generic, JUnit test class, và Factory pattern).
+👉 Bạn có muốn mình tạo phiên bản đó (có cả commit history gợi ý để push GitHub) không?
