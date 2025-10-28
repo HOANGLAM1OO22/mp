@@ -1,0 +1,118 @@
+package cleanbubblesort;
+
+public class BubbleSorter {
+
+    public enum SortOrder {
+        ASCENDING,
+        DESCENDING
+    }
+
+    /** Public API: bubble sort using order text ("ascending"/"descending") */
+    public static void bubbleSort(double[] array, String orderText) {
+        if (!validateArray(array)) return;
+        SortOrder order = parseOrder(orderText);
+        bubbleSort(array, order);
+    }
+
+    /** Overload: bubble sort using enum for safety */
+    public static void bubbleSort(double[] array, SortOrder order) {
+        if (!validateArray(array)) return;
+        bubbleSortCore(array, order);
+    }
+
+    /** Overload: bubble sort for int[] using String order */
+    public static void bubbleSort(int[] array, String orderText) {
+        if (!validateArray(array)) return;
+        SortOrder order = parseOrder(orderText);
+        bubbleSort(array, order);
+    }
+
+    /** Overload: bubble sort for int[] using enum order */
+    public static void bubbleSort(int[] array, SortOrder order) {
+        if (!validateArray(array)) return;
+        bubbleSortCore(array, order);
+    }
+
+    /** Validate array: check null or empty */
+    public static boolean validateArray(double[] array) {
+        if (array == null) {
+            System.err.println("Error: array is null");
+            return false;
+        }
+        if (array.length == 0) {
+            System.err.println("Error: array is empty");
+            return false;
+        }
+        return true;
+    }
+
+    /** Validate array: check null or empty (int[]) */
+    public static boolean validateArray(int[] array) {
+        if (array == null) {
+            System.err.println("Error: array is null");
+            return false;
+        }
+        if (array.length == 0) {
+            System.err.println("Error: array is empty");
+            return false;
+        }
+        return true;
+    }
+
+    // ========== INTERNALS ==========
+
+    private static SortOrder parseOrder(String text) {
+        if (text == null) return SortOrder.ASCENDING;
+        return "descending".equalsIgnoreCase(text)
+                ? SortOrder.DESCENDING
+                : SortOrder.ASCENDING;
+    }
+
+    private static void bubbleSortCore(double[] array, SortOrder order) {
+        boolean swapped;
+        for (int i = 0; i < array.length - 1; i++) {
+            swapped = false;
+            for (int j = 0; j < array.length - i - 1; j++) {
+                if (shouldSwap(array[j], array[j + 1], order)) {
+                    swap(array, j, j + 1);
+                    swapped = true;
+                }
+            }
+            if (!swapped) break;
+        }
+    }
+
+    private static void bubbleSortCore(int[] array, SortOrder order) {
+        boolean swapped;
+        for (int i = 0; i < array.length - 1; i++) {
+            swapped = false;
+            for (int j = 0; j < array.length - i - 1; j++) {
+                if (shouldSwap(array[j], array[j + 1], order)) {
+                    swap(array, j, j + 1);
+                    swapped = true;
+                }
+            }
+            if (!swapped) break;
+        }
+    }
+
+    private static boolean shouldSwap(double a, double b, SortOrder order) {
+        return (order == SortOrder.ASCENDING) ? a > b : a < b;
+    }
+
+    private static boolean shouldSwap(int a, int b, SortOrder order) {
+        return (order == SortOrder.ASCENDING) ? a > b : a < b;
+    }
+
+    private static void swap(double[] array, int i, int j) {
+        double tmp = array[i];
+        array[i] = array[j];
+        array[j] = tmp;
+    }
+
+    private static void swap(int[] array, int i, int j) {
+        int tmp = array[i];
+        array[i] = array[j];
+        array[j] = tmp;
+    }
+}
