@@ -1,0 +1,168 @@
+package cleanbubblesort;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class BubbleSorterTest {
+
+    // --- validateArray() tests ---
+    @Test
+    void validateArrayShouldReturnFalseForNullDoubleArray() {
+        assertFalse(BubbleSorter.validateArray((double[]) null));
+    }
+
+    @Test
+    void validateArrayShouldReturnFalseForEmptyDoubleArray() {
+        assertFalse(BubbleSorter.validateArray(new double[]{}));
+    }
+
+    @Test
+    void validateArrayShouldReturnTrueForValidDoubleArray() {
+        assertTrue(BubbleSorter.validateArray(new double[]{1, 2}));
+    }
+
+    @Test
+    void validateArrayShouldReturnFalseForNullIntArray() {
+        assertFalse(BubbleSorter.validateArray((int[]) null));
+    }
+
+    @Test
+    void validateArrayShouldReturnFalseForEmptyIntArray() {
+        assertFalse(BubbleSorter.validateArray(new int[]{}));
+    }
+
+    @Test
+    void validateArrayShouldReturnTrueForValidIntArray() {
+        assertTrue(BubbleSorter.validateArray(new int[]{1, 2}));
+    }
+
+    // --- Sorting behavior tests (double[]) ---
+
+    @Test
+    void sortsDoubleAscending() {
+        double[] input = {5, 3, 8, 4, 6};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new double[]{3, 4, 5, 6, 8}, input);
+    }
+
+    @Test
+    void sortsDoubleDescending() {
+        double[] input = {5, 3, 8, 4, 6};
+        BubbleSorter.bubbleSort(input, "descending");
+        assertArrayEquals(new double[]{8, 6, 5, 4, 3}, input);
+    }
+
+    @Test
+    void sortsDoubleAlreadySorted() {
+        double[] input = {1, 2, 3, 4, 5};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new double[]{1, 2, 3, 4, 5}, input);
+    }
+
+    @Test
+    void sortsDoubleSingleElement() {
+        double[] input = {42.0};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new double[]{42.0}, input);
+    }
+
+    @Test
+    void sortsDoubleAllEqual() {
+        double[] input = {7, 7, 7, 7};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new double[]{7, 7, 7, 7}, input);
+    }
+
+    @Test
+    void sortsDoubleWithNegativeValues() {
+        double[] input = {-3, 0, 2, -1, 1};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new double[]{-3, -1, 0, 1, 2}, input);
+    }
+
+    @Test
+    void sortsDoubleWithDescendingEnumOrder() {
+        double[] input = {9, 5, 6, 2};
+        BubbleSorter.bubbleSort(input, BubbleSorter.SortOrder.DESCENDING);
+        assertArrayEquals(new double[]{9, 6, 5, 2}, input);
+    }
+
+    // --- Sorting behavior tests (int[]) ---
+
+    @Test
+    void sortsIntAscending() {
+        int[] input = {5, 3, 8, 4, 6};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new int[]{3, 4, 5, 6, 8}, input);
+    }
+
+    @Test
+    void sortsIntDescending() {
+        int[] input = {5, 3, 8, 4, 6};
+        BubbleSorter.bubbleSort(input, "descending");
+        assertArrayEquals(new int[]{8, 6, 5, 4, 3}, input);
+    }
+
+    @Test
+    void sortsIntAlreadySortedAscending() {
+        int[] input = {1, 2, 3};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new int[]{1, 2, 3}, input);
+    }
+
+    @Test
+    void sortsIntSingleElement() {
+        int[] input = {9};
+        BubbleSorter.bubbleSort(input, "descending");
+        assertArrayEquals(new int[]{9}, input);
+    }
+
+    @Test
+    void sortsIntAllSameValues() {
+        int[] input = {4, 4, 4, 4};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new int[]{4, 4, 4, 4}, input);
+    }
+
+    @Test
+    void sortsIntWithNegativeNumbersAscending() {
+        int[] input = {-1, 3, -5, 2, 0};
+        BubbleSorter.bubbleSort(input, "ascending");
+        assertArrayEquals(new int[]{-5, -1, 0, 2, 3}, input);
+    }
+
+    @Test
+    void sortsIntWithNegativeNumbersDescending() {
+        int[] input = {-1, 3, -5, 2, 0};
+        BubbleSorter.bubbleSort(input, "descending");
+        assertArrayEquals(new int[]{3, 2, 0, -1, -5}, input);
+    }
+
+    @Test
+    void sortsIntDescendingEnumOrder() {
+        int[] input = {10, 5, 20, 15};
+        BubbleSorter.bubbleSort(input, BubbleSorter.SortOrder.DESCENDING);
+        assertArrayEquals(new int[]{20, 15, 10, 5}, input);
+    }
+
+    @Test
+    void sortsIntAscendingEnumOrder() {
+        int[] input = {10, 5, 20, 15};
+        BubbleSorter.bubbleSort(input, BubbleSorter.SortOrder.ASCENDING);
+        assertArrayEquals(new int[]{5, 10, 15, 20}, input);
+    }
+
+    @Test
+    void ignoresUnknownOrderTextAndDefaultsToAscending() {
+        int[] input = {4, 1, 3, 2};
+        BubbleSorter.bubbleSort(input, "unknown");
+        assertArrayEquals(new int[]{1, 2, 3, 4}, input);
+    }
+
+    @Test
+    void handlesNullOrderTextGracefully() {
+        int[] input = {3, 1, 2};
+        BubbleSorter.bubbleSort(input, (String) null);
+        assertArrayEquals(new int[]{1, 2, 3}, input);
+    }
+}
