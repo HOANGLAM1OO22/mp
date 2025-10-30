@@ -1,0 +1,429 @@
+Tuyệt rồi — mình sẽ dẫn bạn làm **SuperMarket TDD** theo đúng “bảo vệ legacy → thêm tính năng mới (Bundle)” với các bước Red → Green → Refactor. Mình đưa luôn code test + patch tối thiểu để bạn copy chạy, thứ tự từng commit rõ ràng.
+
+---
+
+# Kế hoạch TDD (đề xuất theo commit)
+
+1. **[Protect Legacy]** Viết unit test phủ các khuyến mãi đang có:
+   `TenPercentDiscount`, `ThreeForTwo`, `TwoForAmount`, `FiveForAmount`.
+2. **[Golden Master]** Viết test cho `ReceiptPrinter` để khóa format hóa đơn (sẽ phát hiện bug in ra số lượng dạng hex cho sản phẩm `Each`).
+3. **[Green cho GM]** Sửa bug `%x` → in số thập phân.
+4. **[New Feature]** Thêm **Bundle Discount (gói sản phẩm)**: mua đủ *1 toothbrush + 1 toothpaste* → **-10%** tổng tiền 2 món trong gói. Chỉ đếm số bundle *đầy đủ* (VD: 2 bàn chải + 1 kem chỉ tính 1 bundle).
+5. **[Tests for Bundle]** Viết test cho các tổ hợp: đủ gói, dư lệch, nhiều gói, gộp cùng các ưu đãi cũ (nếu có).
+
+Dưới đây là toàn bộ **mẫu test & code thay đổi** theo thứ tự (bạn có thể gom lại thành các commit tương ứng).
+
+---
+
+## 1) Unit tests “bảo vệ legacy” (khuyến mãi hiện có)
+
+Tạo file `src/test/java/dojo/supermarket/model/OffersLegacyTest.java`:
+
+```java
+package dojo.supermarket.model;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+import java.util.List;
+
+public class OffersLegacyTest {
+
+    @Test
+    void tenPercentDiscount_onApples_byWeight() {
+        SupermarketCatalog catalog = new FakeCatalog();
+        Product apples = new Product("apples", ProductUnit.Kilo);
+        catalog.addProduct(apples, 1.99);
+
+        Teller teller = new Teller(catalog);
+        teller.addSpecialOffer(SpecialOfferType.TenPercentDiscount, apples, 20.0);
+
+        ShoppingCart cart = new ShoppingCart();
+        cart.addItemQuantity(apples, 2.0); // 2kg
+
+        Receipt receipt = teller.checksOutArticlesFrom(cart);
+
+        assertEquals(1.99 * 2 - (1.99 * 2 * 0.20), receipt.getTotalPrice(), 0.001);
+        assertEquals(1, receipt.getDiscounts().size());
+        assertEquals(apples, receipt.getDiscounts().get(0).getProduct());
+        assertTrue(receipt.getDiscounts().get(0).getDescription().contains("% off"));
+    }
+
+    @Test
+    void threeForTwo_onTomatoes() {
+        SupermarketCatalog catalog = new FakeCatalog();
+        Product tomatoes = new Product("cherry tomatoes", ProductUnit.Each);
+        catalog.addProduct(tomatoes, 0.69);
+
+        Teller teller = new Teller(catalog);
+        teller.addSpecialOffer(SpecialOfferType.ThreeForTwo, tomatoes, 0.0);
+
+        ShoppingCart cart = new ShoppingCart();
+        cart.addItemQuantity(tomatoes, 3);
+
+        Receipt receipt = teller.checksOutArticlesFrom(cart);
+
+        double expected = 3 * 0.69 - 0.69; // pay 2
+        assertEquals(expected, receipt.getTotalPrice(), 0.001);
+        assertEquals(1, receipt.getDiscounts().size());
+    }
+
+    @Test
+    void twoForAmount_onToothbrush_buy3() {
+        SupermarketCatalog catalog = new FakeCatalog();
+        Product toothbrush = new Product("toothbrush", ProductUnit.Each);
+        catalog.addProduct(toothbrush, 0.99);
+
+        Teller teller = new Teller(catalog);
+        teller.addSpecialOffer(SpecialOfferType.TwoForAmount, toothbrush, 1.50);
+
+        ShoppingCart cart = new ShoppingCart();
+        cart.addItemQuantity(toothbrush, 3);
+
+        Receipt receipt = teller.checksOutArticlesFrom(cart);
+
+        // price = 3*0.99, offer = 2 for 1.50 + 1*0.99
+        double expected = 1.50 + 0.99;
+        assertEquals(expected, receipt.getTotalPrice(), 0.001);
+        assertEquals(1, receipt.getDiscounts().size());
+    }
+
+    @Test
+    void fiveForAmount_onToothpaste_buy7() {
+        SupermarketCatalog catalog = new FakeCatalog();
+        Product toothpaste = new Product("toothpaste", ProductUnit.Each);
+        catalog.addProduct(toothpaste, 1.79);
+
+        Teller teller = new Teller(catalog);
+        teller.addSpecialOffer(SpecialOfferType.FiveForAmount, toothpaste, 7.49);
+
+        ShoppingCart cart = new ShoppingCart();
+        cart.addItemQuantity(toothpaste, 7);
+
+        Receipt receipt = teller.checksOutArticlesFrom(cart);
+
+        // price = 7*1.79, offer = 5 for 7.49 + 2*1.79
+        double expected = 7.49 + 2*1.79;
+        assertEquals(expected, receipt.getTotalPrice(), 0.001);
+        assertEquals(1, receipt.getDiscounts().size());
+    }
+}
+```
+
+> Các test này giúp khóa hành vi hiện tại của `ShoppingCart.handleOffers(...)` và `Teller.checksOutArticlesFrom(...)` (đang cộng mục rồi áp khuyến mãi) — chính xác theo code bạn đang có. `Teller` tạo từng dòng hóa đơn rồi gọi `handleOffers` để thêm `Discount` (giữ nguyên flow cũ).  
+
+---
+
+## 2) Golden Master cho `ReceiptPrinter` (sẽ RED do bug in số lượng dạng hex)
+
+Tạo `src/test/java/dojo/supermarket/ReceiptPrinterGoldenMasterTest.java`:
+
+```java
+package dojo.supermarket;
+
+import dojo.supermarket.model.*;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class ReceiptPrinterGoldenMasterTest {
+    @Test
+    void printReceipt_multiline_formatStable() {
+        SupermarketCatalog catalog = new FakeCatalog();
+        Product apples = new Product("apples", ProductUnit.Kilo);
+        Product toothbrush = new Product("toothbrush", ProductUnit.Each);
+        catalog.addProduct(apples, 1.99);
+        catalog.addProduct(toothbrush, 0.99);
+
+        Teller teller = new Teller(catalog);
+        teller.addSpecialOffer(SpecialOfferType.TenPercentDiscount, apples, 20.0);
+
+        ShoppingCart cart = new ShoppingCart();
+        cart.addItemQuantity(apples, 2.000);
+        cart.addItemQuantity(toothbrush, 10); // cố ý > 9 để lộ bug hex
+
+        Receipt receipt = teller.checksOutArticlesFrom(cart);
+        ReceiptPrinter printer = new ReceiptPrinter(40);
+
+        String printed = printer.printReceipt(receipt);
+
+        String expected =
+            "apples                              3.98\n" +
+            "  1.99 * 2.000\n" +
+            "toothbrush                          9.90\n" +
+            "  0.99 * 10\n" +           // số lượng phải là "10" thập phân
+            "20.0% off(apples)                 -0.80\n" +
+            "\n" +
+            "Total:                              13.08\n";
+
+        assertEquals(expected, printed);
+    }
+}
+```
+
+**Vì sao sẽ fail?** Trong `ReceiptPrinter.presentQuantity(...)` bạn đang dùng `String.format("%x", (int)item.getQuantity())` cho loại `Each`, nên 10 sẽ in thành **`a`** (hệ hex) — đó là bug chúng ta muốn khóa rồi sửa. 
+
+---
+
+## 3) Sửa bug ReceiptPrinter (GREEN cho GM)
+
+Sửa `presentQuantity(...)` trong `ReceiptPrinter.java`:
+
+```java
+private static String presentQuantity(ReceiptItem item) {
+    return ProductUnit.Each.equals(item.getProduct().getUnit())
+            ? String.format(Locale.UK, "%.0f", item.getQuantity()) // FIX: was "%x"
+            : String.format(Locale.UK, "%.3f", item.getQuantity());
+}
+```
+
+> Đây là thay đổi rất nhỏ nhưng quan trọng để GM test xanh. 
+
+---
+
+## 4) Thêm **Bundle Discount** (gói sản phẩm)
+
+### 4.1) Tạo lớp `BundleOffer`
+
+`src/main/java/dojo/supermarket/model/BundleOffer.java`:
+
+```java
+package dojo.supermarket.model;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class BundleOffer {
+    private final String name;
+    private final Map<Product, Double> requiredItems = new LinkedHashMap<>();
+    private final double percentOff; // e.g., 10.0 for 10%
+
+    public BundleOffer(String name, Map<Product, Double> requiredItems, double percentOff) {
+        this.name = name;
+        this.requiredItems.putAll(requiredItems);
+        this.percentOff = percentOff;
+    }
+
+    public String getName() { return name; }
+    public Map<Product, Double> getRequiredItems() { return requiredItems; }
+    public double getPercentOff() { return percentOff; }
+}
+```
+
+### 4.2) Mở rộng `Teller` để nhận bundle
+
+Thêm vào `Teller.java`:
+
+```java
+// ...
+import java.util.ArrayList;
+// ...
+
+public class Teller {
+
+    private final SupermarketCatalog catalog;
+    private Map<Product, Offer> offers = new HashMap<>();
+    private final List<BundleOffer> bundleOffers = new ArrayList<>();
+
+    public Teller(SupermarketCatalog catalog) {
+        this.catalog = catalog;
+    }
+
+    public void addSpecialOffer(SpecialOfferType offerType, Product product, double argument) {
+        this.offers.put(product, new Offer(offerType, product, argument));
+    }
+
+    // NEW
+    public void addBundleOffer(BundleOffer bundle) {
+        this.bundleOffers.add(bundle);
+    }
+
+    public Receipt checksOutArticlesFrom(ShoppingCart theCart) {
+        Receipt receipt = new Receipt();
+        List<ProductQuantity> productQuantities = theCart.getItems();
+        for (ProductQuantity pq: productQuantities) {
+            Product p = pq.getProduct();
+            double quantity = pq.getQuantity();
+            double unitPrice = this.catalog.getUnitPrice(p);
+            double price = quantity * unitPrice;
+            receipt.addProduct(p, quantity, unitPrice, price);
+        }
+        theCart.handleOffers(receipt, this.offers, this.catalog);
+
+        // NEW: evaluate bundles after per-item offers
+        theCart.handleBundleOffers(receipt, this.bundleOffers, this.catalog);
+
+        return receipt;
+    }
+}
+```
+
+> Giữ nguyên flow cũ, chỉ bổ sung thêm bước tính bundle sau khi tính các ưu đãi theo từng sản phẩm. Phần thêm mới không phá legacy. 
+
+### 4.3) Thêm xử lý bundle vào `ShoppingCart`
+
+Mở rộng `ShoppingCart.java`:
+
+```java
+// ...
+import java.util.Map;
+import java.util.List;
+// ...
+
+    void handleOffers(Receipt receipt, Map<Product, Offer> offers, SupermarketCatalog catalog) {
+        // (giữ nguyên code cũ của bạn)
+        // ...
+    }
+
+    // NEW
+    void handleBundleOffers(Receipt receipt, List<BundleOffer> bundles, SupermarketCatalog catalog) {
+        if (bundles == null || bundles.isEmpty()) return;
+
+        for (BundleOffer bundle : bundles) {
+            // Tính số "bundle đầy đủ" có thể tạo từ giỏ hiện tại
+            int fullBundles = Integer.MAX_VALUE;
+            double bundleRegularSum = 0.0;
+
+            for (Map.Entry<Product, Double> e : bundle.getRequiredItems().entrySet()) {
+                Product p = e.getKey();
+                double need = e.getValue();
+                double have = productQuantities.getOrDefault(p, 0.0);
+                int possible = (int) Math.floor(have / need);
+                fullBundles = Math.min(fullBundles, possible);
+
+                // tính tổng giá "cho 1 bundle"
+                bundleRegularSum += need * catalog.getUnitPrice(p);
+            }
+
+            if (fullBundles <= 0) continue;
+
+            double discountAmount = fullBundles * bundleRegularSum * (bundle.getPercentOff() / 100.0);
+
+            // Quy ước: discount gắn với sản phẩm đầu tiên trong bundle để hiển thị
+            Product first = bundle.getRequiredItems().keySet().iterator().next();
+            receipt.addDiscount(new Discount(first, "Bundle: " + bundle.getName(), discountAmount));
+        }
+    }
+```
+
+> `ShoppingCart` đã có `productQuantities` nên ta tận dụng để đếm số bundle đầy đủ: `min(floor(have/need))`. Cách này đúng yêu cầu “chỉ discount cho phần đủ gói”. 
+
+---
+
+## 5) Tests cho **Bundle Discount**
+
+Tạo `src/test/java/dojo/supermarket/model/BundleOfferTest.java`:
+
+```java
+package dojo.supermarket.model;
+
+import org.junit.jupiter.api.Test;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+public class BundleOfferTest {
+
+    private static BundleOffer makeTB_TP_10(Product toothbrush, Product toothpaste) {
+        Map<Product, Double> req = new LinkedHashMap<>();
+        req.put(toothbrush, 1.0);
+        req.put(toothpaste, 1.0);
+        return new BundleOffer("TB+TP 10% off", req, 10.0);
+    }
+
+    @Test
+    void bundle_applies_when_exact_pair() {
+        SupermarketCatalog catalog = new FakeCatalog();
+        Product toothbrush = new Product("toothbrush", ProductUnit.Each);
+        Product toothpaste = new Product("toothpaste", ProductUnit.Each);
+        catalog.addProduct(toothbrush, 0.99);
+        catalog.addProduct(toothpaste, 1.79);
+
+        Teller teller = new Teller(catalog);
+        teller.addBundleOffer(makeTB_TP_10(toothbrush, toothpaste));
+
+        ShoppingCart cart = new ShoppingCart();
+        cart.addItemQuantity(toothbrush, 1);
+        cart.addItemQuantity(toothpaste, 1);
+
+        Receipt receipt = teller.checksOutArticlesFrom(cart);
+
+        double sum = 0.99 + 1.79;
+        double expected = sum - sum * 0.10;
+        assertEquals(expected, receipt.getTotalPrice(), 0.001);
+        assertEquals(1, receipt.getDiscounts().size());
+        assertTrue(receipt.getDiscounts().get(0).getDescription().startsWith("Bundle:"));
+    }
+
+    @Test
+    void bundle_counts_only_full_sets_when_unbalanced() {
+        SupermarketCatalog catalog = new FakeCatalog();
+        Product toothbrush = new Product("toothbrush", ProductUnit.Each);
+        Product toothpaste = new Product("toothpaste", ProductUnit.Each);
+        catalog.addProduct(toothbrush, 0.99);
+        catalog.addProduct(toothpaste, 1.79);
+
+        Teller teller = new Teller(catalog);
+        teller.addBundleOffer(makeTB_TP_10(toothbrush, toothpaste));
+
+        ShoppingCart cart = new ShoppingCart();
+        cart.addItemQuantity(toothbrush, 2); // dư 1 bàn chải
+        cart.addItemQuantity(toothpaste, 1);
+
+        Receipt receipt = teller.checksOutArticlesFrom(cart);
+
+        // chỉ 1 bundle được tính
+        double sumOneBundle = 0.99 + 1.79;
+        double discount = sumOneBundle * 0.10;
+        double expected = 2*0.99 + 1.79 - discount;
+        assertEquals(expected, receipt.getTotalPrice(), 0.001);
+        assertEquals(1, receipt.getDiscounts().size());
+    }
+
+    @Test
+    void bundle_multiple_sets() {
+        SupermarketCatalog catalog = new FakeCatalog();
+        Product toothbrush = new Product("toothbrush", ProductUnit.Each);
+        Product toothpaste = new Product("toothpaste", ProductUnit.Each);
+        catalog.addProduct(toothbrush, 0.99);
+        catalog.addProduct(toothpaste, 1.79);
+
+        Teller teller = new Teller(catalog);
+        teller.addBundleOffer(makeTB_TP_10(toothbrush, toothpaste));
+
+        ShoppingCart cart = new ShoppingCart();
+        cart.addItemQuantity(toothbrush, 3);
+        cart.addItemQuantity(toothpaste, 2);
+
+        Receipt receipt = teller.checksOutArticlesFrom(cart);
+
+        // Có 2 bundle đầy đủ, dư 1 bàn chải
+        double bundleSum = 0.99 + 1.79;
+        double expected = 3*0.99 + 2*1.79 - 2*(bundleSum*0.10);
+        assertEquals(expected, receipt.getTotalPrice(), 0.001);
+        assertEquals(1, receipt.getDiscounts().size());
+    }
+}
+```
+
+---
+
+## Gợi ý đặt tên commit (ngắn, rõ)
+
+* `test: cover existing special offers (legacy protection)`
+* `test: golden master for ReceiptPrinter (format stability)`
+* `fix: ReceiptPrinter prints decimal quantity for Each (not hex)`
+* `feat: bundle discount (buy toothbrush + toothpaste get 10% off)`
+* `test: bundle discount cases (exact, unbalanced, multiple)`
+
+---
+
+## Lưu ý nhỏ về code hiện có
+
+* `ReceiptPrinter.presentQuantity` dùng `%x` là bug (đã fix ở trên). Test GM sẽ giúp tránh tái phát. 
+* `Receipt` đang tính tổng = sum(items) - sum(discounts) (ổn). 
+* `Teller.checksOutArticlesFrom` thêm dòng item trước rồi gọi `handleOffers` — bạn đã đúng hướng khi thêm bundle sau đó. 
+* `ShoppingCart.productQuantities` đã sẵn, rất tiện để đếm số bundle. 
+
+---
+
+Nếu bạn muốn, mình có thể gộp lại toàn bộ **patch dạng unified diff** cho từng file để bạn dán vào IDE, hoặc mình xuất một **zip project skeleton** với đầy đủ test & src.
