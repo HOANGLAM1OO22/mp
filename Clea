@@ -1,0 +1,140 @@
+package org.passwordstrength;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+/**
+ * Evaluates password strength based on length, case mix, digits, symbols, and blacklist.
+ * <p>
+ * Scoring Rules:
+ * <ul>
+ *   <li>+2 if length ≥ 12, +1 if length between 8–11</li>
+ *   <li>+2 if contains both lowercase and uppercase, +1 if contains one case</li>
+ *   <li>+2 if contains digits</li>
+ *   <li>+2 if contains symbols</li>
+ *   <li>−3 if matches a blacklisted word</li>
+ * </ul>
+ * Final strength is clamped between 0–10.
+ */
+public class PasswordStrengthMeter {
+
+    // ---------- Constants ----------
+    private static final Pattern LOWER_CASE = Pattern.compile("[a-z]");
+    private static final Pattern UPPER_CASE = Pattern.compile("[A-Z]");
+    private static final Pattern DIGIT = Pattern.compile("\\d");
+    private static final Pattern SYMBOL = Pattern.compile("[^a-zA-Z0-9]");
+
+    private static final int MAX_SCORE = 10;
+    private static final int MIN_SCORE = 0;
+
+    private static final int LENGTH_SCORE_SHORT = 1;
+    private static final int LENGTH_SCORE_LONG = 2;
+    private static final int CASE_SCORE_SINGLE = 1;
+    private static final int CASE_SCORE_MIXED = 2;
+    private static final int DIGIT_SCORE = 2;
+    private static final int SYMBOL_SCORE = 2;
+    private static final int BLACKLIST_PENALTY = 3;
+
+    private static final int VERY_WEAK_THRESHOLD = 2;
+    private static final int WEAK_THRESHOLD = 4;
+    private static final int MEDIUM_THRESHOLD = 6;
+    private static final int STRONG_THRESHOLD = 8;
+
+    // ---------- State ----------
+    private final Set<String> blacklist;
+
+    // ---------- Enum ----------
+    public enum Strength {
+        VERY_WEAK, WEAK, MEDIUM, STRONG, VERY_STRONG
+    }
+
+    // ---------- Constructors ----------
+    public PasswordStrengthMeter() {
+        this(new HashSet<>(Arrays.asList(
+                "password", "123456", "123456789", "qwerty",
+                "abc123", "111111", "123123", "admin"
+        )));
+    }
+
+    public PasswordStrengthMeter(Set<String> customBlacklist) {
+        Set<String> normalized = new HashSet<>();
+        for (String s : customBlacklist) {
+            normalized.add(s.toLowerCase(Locale.ROOT));
+        }
+        this.blacklist = Collections.unmodifiableSet(normalized);
+    }
+
+    // ---------- Public API ----------
+    public Strength assess(String password) {
+        if (isBlank(password)) {
+            return Strength.VERY_WEAK;
+        }
+
+        int score = computeScore(password);
+        return mapScoreToStrength(score);
+    }
+
+    // ---------- Core Scoring ----------
+    private int computeScore(String password) {
+        int score = 0;
+
+        score += scoreForLength(password);
+        score += scoreForCase(password);
+        score += scoreForDigits(password);
+        score += scoreForSymbols(password);
+
+        if (isBlacklisted(password)) {
+            score -= BLACKLIST_PENALTY;
+        }
+
+        return clamp(score, MIN_SCORE, MAX_SCORE);
+    }
+
+    private int scoreForLength(String password) {
+        int len = password.length();
+        if (len >= 12) return LENGTH_SCORE_LONG;
+        if (len >= 8) return LENGTH_SCORE_SHORT;
+        return 0;
+    }
+
+    private int scoreForCase(String password) {
+        boolean hasLower = LOWER_CASE.matcher(password).find();
+        boolean hasUpper = UPPER_CASE.matcher(password).find();
+        if (hasLower && hasUpper) return CASE_SCORE_MIXED;
+        if (hasLower || hasUpper) return CASE_SCORE_SINGLE;
+        return 0;
+    }
+
+    private int scoreForDigits(String password) {
+        return DIGIT.matcher(password).find() ? DIGIT_SCORE : 0;
+    }
+
+    private int scoreForSymbols(String password) {
+        return SYMBOL.matcher(password).find() ? SYMBOL_SCORE : 0;
+    }
+
+    private boolean isBlacklisted(String password) {
+        return blacklist.contains(password.toLowerCase(Locale.ROOT));
+    }
+
+    // ---------- Utility ----------
+    private boolean isBlank(String text) {
+        return text == null || text.trim().isEmpty();
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private Strength mapScoreToStrength(int score) {
+        if (score <= VERY_WEAK_THRESHOLD) return Strength.VERY_WEAK;
+        if (score <= WEAK_THRESHOLD) return Strength.WEAK;
+        if (score <= MEDIUM_THRESHOLD) return Strength.MEDIUM;
+        if (score <= STRONG_THRESHOLD) return Strength.STRONG;
+        return Strength.VERY_STRONG;
+    }
+}
