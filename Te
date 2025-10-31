@@ -1,0 +1,137 @@
+private fun makeConverter(task: VideoTranscodingTask): Operator {
+    fun Int.roundEven() = if (this and 1 == 1) this + 1 else this
+    fun correctionRotation(src: Int, dst: Int): Int {
+        var diff = (src - dst) % 360
+        if (diff < 0) diff += 360
+        return diff
+    }
+
+    val srcW = task.getVideoWidth()
+    val srcH = task.getVideoHeight()
+    val dstW = task.getTranscodingVideoWidth()
+    val dstH = task.getTranscodingVideoHeight()
+    val srcRot = task.getRotation()
+    val dstRot = task.getTranscodingRotation()
+    val corrRot = correctionRotation(srcRot, dstRot)
+    val swap = corrRot == 90 || corrRot == 270
+
+    val rotW = if (swap) srcH else srcW
+    val rotH = if (swap) srcW else srcH
+
+    // Aspect match and crop rect
+    val srcAspect = rotW.toFloat() / rotH
+    val dstAspect = dstW.toFloat() / dstH
+    val cropRect = if (srcAspect > dstAspect) {
+        val cropW = (rotH * dstAspect).toInt()
+        val x = ((rotW - cropW) / 2).coerceAtLeast(0)
+        Rect(x, 0, x + cropW, rotH)
+    } else if (srcAspect < dstAspect) {
+        val cropH = (rotW / dstAspect).toInt()
+        val y = ((rotH - cropH) / 2).coerceAtLeast(0)
+        Rect(0, y, rotW, y + cropH)
+    } else Rect(0, 0, rotW, rotH)
+
+    val cropW = cropRect.width()
+    val cropH = cropRect.height()
+    val scale = minOf(dstW.toFloat() / cropW, dstH.toFloat() / cropH)
+    val doResize = scale < 1.0f
+
+    SLog.i(TAG, "makeConverter: src=${srcW}x${srcH}, rot=${corrRot}, crop=${cropW}x${cropH}, dst=${dstW}x${dstH}, scale=$scale")
+
+    val converters = mutableListOf<Pair<ImgpType, UniImgp>>()
+    if (corrRot != 0) converters += ImgpType.ROTATE to UniImgp.ofRotate()
+    if (!(cropRect.left == 0 && cropRect.top == 0 && cropRect.right == rotW && cropRect.bottom == rotH))
+        converters += ImgpType.CROP to UniImgp.ofCrop()
+    if (doResize) converters += ImgpType.RESIZE to UniImgp.ofResize()
+
+    return Operator { ibuf, obuf ->
+        var input = ibuf
+        var output = obuf
+
+        for ((type, op) in converters) {
+            output = when (type) {
+                ImgpType.ROTATE -> {
+                    MediaBuffer.newImageAlloc().apply {
+                        val fmt = input.format.toMutableFormat().apply {
+                            setRotation(corrRot)
+                            if (swap) {
+                                setCols(input.rows)
+                                setRows(input.cols)
+                            }
+                        }
+                        setMediaFormat(fmt)
+                    }.allocateMutable()
+                }
+
+                ImgpType.CROP -> {
+                    MediaBuffer.newImageAlloc().apply {
+                        val fmt = input.format.toMutableFormat().apply {
+                            setCropRect(cropRect)
+                            setCols(cropW)
+                            setRows(cropH)
+                        }
+                        setMediaFormat(fmt)
+                    }.allocateMutable()
+                }
+
+                ImgpType.RESIZE -> {
+                    MediaBuffer.newImageAlloc().apply {
+                        val fmt = input.format.toMutableFormat().apply {
+                            setCols(dstW.roundEven())
+                            setRows(dstH.roundEven())
+                        }
+                        setMediaFormat(fmt)
+                    }.allocateMutable()
+                }
+
+                else -> throw UnsupportedOperationException("Unsupported ImgpType=$type")
+            }
+
+            SLog.i(TAG, "Running converter: $type, in=${input.cols}x${input.rows}, out=${output.cols}x${output.rows}")
+            input = op.run(input, output)
+        }
+
+        if (converters.isEmpty()) {
+            // Direct copy nếu không cần xử lý
+            if (obuf.isEmpty()) obuf.put(input) else obuf.put(MediaBuffer.of(input.format, input.data))
+        } else {
+            obuf.put(output)
+        }
+
+        // Dump debug
+        if (task.path().contains("20251024_112839")) {
+            dumpBufferToFile(obuf, "final_${task.id}")
+        }
+
+        obuf
+    }
+}
+private fun dumpBufferToFile(buf: MediaBuffer, name: String) {
+    try {
+        val dumpDir = File("/sdcard/Download/dump_frames").apply { mkdirs() }
+        val rgbaBuf = MediaBuffer.newImageAlloc()
+            .setShape(buf.cols, buf.rows)
+            .setColorFormat(ColorFormat.RGBA)
+            .allocate()
+
+        UniImgp.ofCvtColor().run(buf, rgbaBuf)
+
+        val outPath = "${dumpDir.absolutePath}/$name.jpg"
+        val jpegBuf = MediaBuffer.newImageAlloc()
+            .setCodecType(CodecType.JPEG_QURAM)
+            .setColorFormat(ColorFormat.NV12)
+            .setExtra(Message.KEY_OUT_FILE, outPath)
+            .asCompressed()
+            .allocate()
+
+        UniImgp.ofEncode().run(rgbaBuf, jpegBuf)
+        SLog.i(TAG, "Dumped frame to $outPath")
+
+        rgbaBuf.release()
+        jpegBuf.release()
+    } catch (e: Exception) {
+        SLog.e(TAG, "dumpBufferToFile failed: ${e.message}")
+    }
+}
+
+
