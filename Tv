@@ -1,0 +1,224 @@
+// ========= utils =========
+private fun Int.roundToEven(): Int = if (this and 1 == 1) this + 1 else this
+private fun Float.eq1() = kotlin.math.abs(this - 1f) < 1e-3f
+
+private fun needsSwapFor(rotationDeg: Int): Boolean = when (((rotationDeg % 360) + 360) % 360) {
+    90, 270 -> true
+    else -> false
+}
+
+private fun correctionRotation(srcRot: Int, dstRot: Int): Int {
+    var c = (srcRot - dstRot) % 360
+    if (c < 0) c += 360
+    return c
+}
+
+/** Center-crop trên kích thước (w,h) để đạt aspect = tw/th, trả về Rect (x0,y0,x1,y1) */
+private fun computeCenterCropRect(w: Int, h: Int, tw: Int, th: Int): Rect {
+    val srcAspect = w.toFloat() / h
+    val dstAspect = tw.toFloat() / th
+    return if (srcAspect > dstAspect) {
+        // nguồn "rộng" hơn → cắt ngang 2 bên
+        val cropW = (h * dstAspect).toInt()
+        val x = ((w - cropW) / 2).coerceAtLeast(0)
+        Rect(x, 0, x + cropW, h)
+    } else if (srcAspect < dstAspect) {
+        // nguồn "cao" hơn → cắt trên/dưới
+        val cropH = (w / dstAspect).toInt()
+        val y = ((h - cropH) / 2).coerceAtLeast(0)
+        Rect(0, y, w, y + cropH)
+    } else {
+        Rect(0, 0, w, h)
+    }
+}
+
+/** Dump khung hình GPU → JPEG để debug (chuyển sang RGBA CPU trước khi encode JPEG) */
+private fun dumpBufferToFile(buf: MediaBuffer, name: String) {
+    try {
+        val dumpDir = File("/sdcard/Download/dump_frames").apply { mkdirs() }
+
+        val rgbaBuf = MediaBuffer.newImageAlloc()
+            .setShape(buf.cols, buf.rows)
+            .setColorFormat(ColorFormat.RGBA)
+            .allocate()
+
+        // GPU → CPU (RGBA)
+        UniImgp.ofCvtColor().run(buf, rgbaBuf)
+
+        // Encode JPEG (NV12 yêu cầu planar, UniImgp.ENCODE sẽ nội bộ chuyển)
+        val obuf = MediaBuffer.newImageAlloc()
+            .asCompressed()
+            .setCodecType(CodecType.JPEG_QURAM)
+            .setColorFormat(ColorFormat.NV12)
+            .set(Message.KEY_OUT_FILE, "${dumpDir.absolutePath}/$name.jpg")
+            .allocate()
+
+        UniImgp.ofEncode().run(rgbaBuf, obuf)
+
+        rgbaBuf.release()
+        obuf.release()
+        SLog.i(TAG, "Dumped frame → ${dumpDir.absolutePath}/$name.jpg")
+    } catch (e: Exception) {
+        SLog.e(TAG, "Failed to dump frame: ${e.message}")
+    }
+}
+
+// ========= converter chính =========
+private fun makeConverter(task: VideoTranscodingTask): Operator {
+    // 1) Lấy kích thước "decoded" (trước xoay) & target từ VO
+    val srcW = task.getVideoWidth()
+    val srcH = task.getVideoHeight()
+    val targetW = task.getTranscodingVideoWidth()
+    val targetH = task.getTranscodingVideoHeight()
+
+    val rotateCorr = correctionRotation(task.getRotation(), task.getTranscodingRotation())
+    val willSwap = needsSwapFor(rotateCorr)
+
+    // 2) Kích thước sau khi áp rotation (chỉ 90/270 mới hoán đổi)
+    val rotW = if (willSwap) srcH else srcW
+    val rotH = if (willSwap) srcW else srcH
+
+    // 3) Tính crop để đạt đúng aspect (không upscale ở bước này)
+    val cropRect = computeCenterCropRect(rotW, rotH, targetW, targetH)
+    val cropW = cropRect.width()
+    val cropH = cropRect.height()
+
+    // 4) Scale cần thiết từ crop → target (chỉ cho phép downscale)
+    //    Nếu cần upscale, ta bỏ qua RESIZE (scale=1) để tránh crash native,
+    //    và để encoder/consumer xử lý phần còn lại.
+    val scaleW = targetW.toFloat() / cropW
+    val scaleH = targetH.toFloat() / cropH
+    val scale = minOf(scaleW, scaleH)
+    val doResize = scale < 1f - 1e-3f
+
+    SLog.i(
+        TAG, """
+        |makeConverter:
+        | src     : ${srcW}x${srcH}, srcRot=${task.getRotation()}
+        | postRot : ${rotW}x${rotH}, corrRot=$rotateCorr (swap=$willSwap)
+        | target  : ${targetW}x${targetH}, aspect=${"%.3f".format(targetW.toFloat()/targetH)}
+        | crop    : [${cropRect.left},${cropRect.top},${cropRect.right},${cropRect.bottom}] => ${cropW}x${cropH}
+        | scale   : ${"%.3f".format(scale)} (resize=${doResize})
+        """.trimMargin().replace("\n", " ")
+    )
+
+    // 5) Xây chuỗi converter theo thứ tự: ROTATE → CROP → RESIZE(downscale)
+    val steps = mutableListOf<ImgpType>()
+    if (rotateCorr != 0) steps += ImgpType.ROTATE
+    // Nếu cropRect không phủ toàn khung thì mới crop
+    if (!(cropRect.left == 0 && cropRect.top == 0 && cropRect.right == rotW && cropRect.bottom == rotH)) {
+        steps += ImgpType.CROP
+    }
+    if (doResize) steps += ImgpType.RESIZE
+
+    val converters = steps.map { type ->
+        VideoTranscoder.ImgpConverter(
+            when (type) {
+                ImgpType.ROTATE -> UniImgp.ofRotate()
+                ImgpType.CROP -> UniImgp.ofCrop()
+                ImgpType.RESIZE -> UniImgp.ofResize()
+                else -> throw UnsupportedOperationException("Unsupported type in converter chain: $type")
+            }
+        )
+    }
+
+    // 6) Trả về Operator chạy lần lượt từng bước, cấp phát obuf đúng kích thước mỗi bước
+    return Operator { ibuf, obuf ->
+        var input = ibuf
+        var output = obuf
+
+        val wantDump = false // bật true nếu cần ảnh debug
+
+        converters.forEachIndexed { idx, conv ->
+            val isLast = idx == converters.lastIndex
+
+            output = when (conv.imgpType) {
+                ImgpType.ROTATE -> {
+                    // Sau xoay: chỉ thay rotation metadata & hoán đổi rows/cols nếu cần
+                    MediaBuffer.newImageAlloc().apply {
+                        val inFmt = input.format
+                        val outFmt = inFmt.toMutableFormat()
+                            .setRotation(rotateCorr)
+                            .apply {
+                                if (needsSwapFor(rotateCorr)) {
+                                    setCols(inFmt.rows)
+                                    setRows(inFmt.cols)
+                                }
+                                // giữ nguyên màu/channels…
+                            }
+
+                        setMediaFormat(outFmt)
+
+                        if (isLast && obuf.isNotEmpty) {
+                            setData(obuf.getData())
+                        } else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocate().toMutable()
+                }
+
+                ImgpType.CROP -> {
+                    // Crop theo cropRect tính trên kích thước sau xoay
+                    // Nếu trước đó không có ROTATE, cropRect vẫn hợp lệ vì dựa trên rotW/rotH
+                    MediaBuffer.newImageAlloc().apply {
+                        // out = vùng crop, đồng thời set rows/cols = crop size
+                        val outFmt = input.format.toMutableFormat()
+                            .setCropRect(cropRect)
+                            .apply {
+                                setCols(cropW)
+                                setRows(cropH)
+                            }
+                        setMediaFormat(outFmt)
+
+                        if (isLast && obuf.isNotEmpty) {
+                            setData(obuf.getData())
+                        } else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocateMutable()
+                }
+
+                ImgpType.RESIZE -> {
+                    // Downscale về đúng target, đảm bảo chẵn để phù hợp định dạng YUV
+                    MediaBuffer.newImageAlloc().apply {
+                        val outFmt = input.format.toMutableFormat().apply {
+                            setCols(targetW.roundToEven())
+                            setRows(targetH.roundToEven())
+                        }
+                        setMediaFormat(outFmt)
+
+                        if (isLast && obuf.isNotEmpty) {
+                            setData(obuf.getData())
+                        } else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocateMutable()
+                }
+
+                else -> throw UnsupportedOperationException()
+            }
+
+            // Chạy từng bước
+            if (wantDump) dumpBufferToFile(input, "in_${conv.imgpType.name.lowercase()}")
+            input = conv.run(input, output)
+            if (wantDump) dumpBufferToFile(input, "out_${conv.imgpType.name.lowercase()}")
+        }
+
+        // Kết thúc: trả về output cuối hoặc input nếu không có bước nào
+        if (converters.isEmpty()) {
+            // Không cần xử lý: nếu kích thước và rotation đã khớp thì pass-through
+            // đảm bảo obuf nhận đúng data để upstream dùng tiếp
+            if (obuf.isEmpty()) {
+                obuf.put(input)
+            } else {
+                obuf.setData(input.getData())
+            }
+            obuf
+        } else {
+            output
+        }
+    }
+}
