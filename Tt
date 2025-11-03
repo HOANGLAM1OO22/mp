@@ -1,0 +1,138 @@
+private fun computeCropRect(inFormat: SumMediaFormat, outFormat: SumMediaFormat): Rect {
+    // Ensure safe cropping (avoid negative or overflow coordinates)
+    val w = outFormat.cols.coerceAtMost(inFormat.cols)
+    val h = outFormat.rows.coerceAtMost(inFormat.rows)
+    val x = ((inFormat.cols - w) / 2).coerceIn(0, inFormat.cols - w)
+    val y = ((inFormat.rows - h) / 2).coerceIn(0, inFormat.rows - h)
+
+    SLog.i(TAG, """computeCropRect:
+        | src w/h[${inFormat.cols}/${inFormat.rows}],
+        | dst w/h[${outFormat.cols}/${outFormat.rows}],
+        | crop x/y[$x/$y], w/h[$w/$h]
+    """.trimToOneLine())
+
+    return Rect(x, y, x + w, y + h)
+}
+
+private fun makeConverter(task: VideoTranscodingTask): Operator {
+    if (SemSystemProperties.getBoolean("secmm.motionphoto.convert-to-copy", false)) {
+        return Operator { ibuf, obuf ->
+            val input = ibuf.getTypedData(HardwareBuffer::class.java)
+            val output = obuf.getTypedData(HardwareBuffer::class.java)
+            SharedBufferManager.copyHwBufferToHwBuffer(input, output)
+            obuf
+        }
+    }
+
+    val srcRot = task.getRotation()
+    val dstRot = task.getTranscodingRotation()
+    val isRequiredToRotate = srcRot != dstRot
+
+    // ✅ fix width/height after rotation (90 or 270 degrees swap W/H)
+    val (rotatedWidth, rotatedHeight) = if (srcRot % 180 != 0) {
+        task.getVideoHeight() to task.getVideoWidth()
+    } else {
+        task.getVideoWidth() to task.getVideoHeight()
+    }
+
+    val scale = maxOf(
+        task.getTranscodingVideoWidth().toFloat() / rotatedWidth,
+        task.getTranscodingVideoHeight().toFloat() / rotatedHeight
+    )
+
+    val isRequiredResize = scale != 1f
+    val isRequiredToCrop = (rotatedWidth.toFloat() / rotatedHeight) != task.getTranscodingVideoRatio()
+
+    SLog.i(TAG, """makeConverter:
+        | src: ${task.getVideoWidth()}x${task.getVideoHeight()}, rot=$srcRot
+        | rotated: ${rotatedWidth}x${rotatedHeight}
+        | dst: ${task.getTranscodingVideoWidth()}x${task.getTranscodingVideoHeight()}, rot=$dstRot
+        | scale=$scale, needRotate=$isRequiredToRotate, needResize=$isRequiredResize, needCrop=$isRequiredToCrop
+    """.trimToOneLine())
+
+    val converters = mutableListOf<ImgpConverter>()
+
+    // ✅ fix converter order
+    if (srcRot == 90 || srcRot == 270) {
+        if (isRequiredResize) converters += ImgpConverter(UniImgp.ofResize())
+        if (isRequiredToRotate) converters += ImgpConverter(UniImgp.ofRotate())
+    } else {
+        if (isRequiredToRotate) converters += ImgpConverter(UniImgp.ofRotate())
+        if (isRequiredResize) converters += ImgpConverter(UniImgp.ofResize())
+    }
+    if (isRequiredToCrop) converters += ImgpConverter(UniImgp.ofCrop())
+
+    return Operator { ibuf, obuf ->
+        var input = ibuf
+        var output = obuf
+
+        var dumpOnce = false
+
+        for (imgpConverter in converters) {
+            val isLast = imgpConverter == converters.last()
+            output = when (imgpConverter.imgpType) {
+                ImgpType.ROTATE -> {
+                    SLog.i(TAG, "--- ROTATE ---")
+                    MediaBuffer.newImageAlloc().apply {
+                        val newFormat = input.format
+                            .toMutableFormat()
+                            .setCols(input.format.rows)
+                            .setRows(input.format.cols)
+                            .setRotation(getCorrectionRotation(srcRot, dstRot))
+
+                        setMediaFormat(newFormat)
+                        if (isLast && obuf.isNotEmpty) setData(obuf.getData())
+                        else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocateMutable()
+                }
+
+                ImgpType.RESIZE -> {
+                    SLog.i(TAG, "--- RESIZE ---")
+                    MediaBuffer.newImageAlloc().apply {
+                        val newFormat = input.format.toMutableFormat().apply {
+                            cols = (cols * scale).roundToNearestEven()
+                            rows = (rows * scale).roundToNearestEven()
+                        }
+                        setMediaFormat(newFormat)
+                        if (isLast && obuf.isNotEmpty) setData(obuf.getData())
+                        else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocateMutable()
+                }
+
+                ImgpType.CROP -> {
+                    SLog.i(TAG, "--- CROP ---")
+                    MediaBuffer.newImageAlloc().apply {
+                        val cropRect = computeCropRect(input.format, obuf.format)
+                        val newFormat = obuf.format
+                            .toMutableFormat()
+                            .setCropRect(cropRect)
+
+                        setMediaFormat(newFormat)
+                        if (isLast && obuf.isNotEmpty) setData(obuf.getData())
+                        else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocateMutable()
+                }
+
+                else -> throw UnsupportedOperationException("Unsupported imgpType=${imgpConverter.imgpType}")
+            }
+
+            input = imgpConverter.run(input, output)
+
+            if (!dumpOnce && task.path().contains("145219")) {
+                MediaBufferFileWriter("/sdcard/Download", "dump_${imgpConverter.imgpType.name.lowercase()}").write(input)
+                dumpOnce = true
+            }
+        }
+
+        output
+    }
+}
