@@ -1,0 +1,158 @@
+private fun getCorrectionRotation(src: Int, dst: Int): Int {
+    // Compute rotation correction needed to align src → dst
+    var correction = src - dst
+    if (correction < 0) correction += 360
+    SLog.i(TAG, "getCorrectionRotation: src=$src, dst=$dst, correction=$correction")
+    return correction
+}
+
+/**
+ * Safely computes crop rectangle based on in/out format sizes.
+ * Prevents negative or overflow values to avoid OpenCV crash.
+ */
+private fun computeCropRect(inFormat: SumMediaFormat, outFormat: SumMediaFormat): Rect {
+    val x = ((inFormat.cols - outFormat.cols) / 2).coerceAtLeast(0)
+    val y = ((inFormat.rows - outFormat.rows) / 2).coerceAtLeast(0)
+    val w = outFormat.cols.coerceAtMost(inFormat.cols - x)
+    val h = outFormat.rows.coerceAtMost(inFormat.rows - y)
+
+    SLog.i(TAG, """computeCropRect:
+        | src w/h=${inFormat.cols}/${inFormat.rows},
+        | dst w/h=${outFormat.cols}/${outFormat.rows},
+        | cropRect x=$x, y=$y, w=$w, h=$h
+    """.trimToOneLine())
+    return Rect(x, y, x + w, y + h)
+}
+
+/**
+ * Builds image-processing converter chain (rotate → resize → crop)
+ * based on rotation, scale, and aspect ratio changes.
+ */
+private fun makeConverter(task: VideoTranscodingTask): Operator {
+    if (SemSystemProperties.getBoolean("secmm.motionphoto.convert-to-copy", false)) {
+        // Simple copy (no transform)
+        return Operator { ibuf, obuf ->
+            val input = ibuf.getTypedData(HardwareBuffer::class.java)
+            val output = obuf.getTypedData(HardwareBuffer::class.java)
+            SLog.i(TAG, "copyHwBuffer input=${input.width}x${input.height}, output=${output.width}x${output.height}")
+            SharedBufferManager.copyHwBufferToHwBuffer(input, output)
+            obuf
+        }
+    }
+
+    val srcRotation = task.getRotation()
+    val dstRotation = task.getTranscodingRotation()
+    val isRequiredToRotate = srcRotation != dstRotation
+    val correctionRotation = getCorrectionRotation(srcRotation, dstRotation)
+
+    // Compute effective input dimensions after rotation
+    val rotatedWidth = if (isRequiredToRotate && task.isRatioChangedAfterRotate())
+        task.getVideoHeight() else task.getVideoWidth()
+    val rotatedHeight = if (isRequiredToRotate && task.isRatioChangedAfterRotate())
+        task.getVideoWidth() else task.getVideoHeight()
+
+    val targetWidth = task.getTranscodingVideoWidth()
+    val targetHeight = task.getTranscodingVideoHeight()
+
+    // Compute scale AFTER rotation
+    val scale = maxOf(
+        targetWidth.toFloat() / rotatedWidth.toFloat(),
+        targetHeight.toFloat() / rotatedHeight.toFloat()
+    )
+
+    val isRequiredResize = scale != 1f
+    val isRequiredToCrop = abs(rotatedWidth.toFloat() / rotatedHeight - targetWidth.toFloat() / targetHeight) > 0.01f
+
+    SLog.i(TAG, """makeConverter:
+        | src=${task.path()},
+        | src w/h/rot=${task.getVideoWidth()}/${task.getVideoHeight()}/${srcRotation},
+        | dst w/h/rot=${targetWidth}/${targetHeight}/${dstRotation},
+        | after-rot w/h=$rotatedWidth/$rotatedHeight,
+        | isRequiredRotate=$isRequiredToRotate,
+        | isRequiredResize=$isRequiredResize,
+        | isRequiredCrop=$isRequiredToCrop,
+        | scale=$scale
+    """.trimToOneLine())
+
+    val converters = mutableListOf<ImgpConverter>()
+    if (isRequiredToRotate) converters += ImgpConverter(UniImgp.ofRotate())
+    if (isRequiredResize) converters += ImgpConverter(UniImgp.ofResize())
+    if (isRequiredToCrop) converters += ImgpConverter(UniImgp.ofCrop())
+
+    return Operator { ibuf, obuf ->
+        var input = ibuf
+        var output = obuf
+        var dump = false
+
+        for (imgpConverter in converters) {
+            val isLast = imgpConverter == converters.last()
+
+            output = when (imgpConverter.imgpType) {
+                ImgpType.ROTATE -> {
+                    SLog.i(TAG, "--- ROTATE ---")
+                    MediaBuffer.newImageAlloc().apply {
+                        val newFormat = input.format
+                            .toMutableFormat()
+                            .setCols(input.format.rows)
+                            .setRows(input.format.cols)
+                            .setRotation(correctionRotation)
+
+                        setMediaFormat(newFormat)
+                        if (isLast && obuf.isNotEmpty) setData(obuf.getData())
+                        else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocateMutable()
+                }
+
+                ImgpType.RESIZE -> {
+                    SLog.i(TAG, "--- RESIZE ---")
+                    SLog.i(TAG, "before resize: in=${input.format.cols}x${input.format.rows}, scale=$scale")
+                    MediaBuffer.newImageAlloc().apply {
+                        val newFormat = input.format.toMutableFormat().apply {
+                            cols = (cols * scale).roundToNearestEven().coerceAtLeast(2)
+                            rows = (rows * scale).roundToNearestEven().coerceAtLeast(2)
+                        }
+                        setMediaFormat(newFormat)
+                        SLog.i(TAG, "after resize: new=${newFormat.cols}x${newFormat.rows}")
+                        if (isLast && obuf.isNotEmpty) setData(obuf.getData())
+                        else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocateMutable()
+                }
+
+                ImgpType.CROP -> {
+                    SLog.i(TAG, "--- CROP ---")
+                    MediaBuffer.newImageAlloc().apply {
+                        val cropRect = computeCropRect(input.format, obuf.format)
+                        val newFormat = obuf.format
+                            .toMutableFormat()
+                            .setCropRect(cropRect)
+
+                        setMediaFormat(newFormat)
+                        if (isLast && obuf.isNotEmpty) setData(obuf.getData())
+                        else {
+                            asSharable()
+                            setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                        }
+                    }.allocateMutable()
+                }
+
+                else -> throw UnsupportedOperationException("Unsupported ImgpType=${imgpConverter.imgpType}")
+            }
+
+            // Run native filter
+            input = imgpConverter.run(input, output)
+
+            // Optional dump for debug
+            if (!dump && task.path().contains("145219") && imgpConverter.imgpType == ImgpType.ROTATE) {
+                MediaBufferFileWriter("/sdcard/Download", "dump").write(input)
+                dump = true
+            }
+        }
+        output
+    }
+}
