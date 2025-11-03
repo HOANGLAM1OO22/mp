@@ -1,0 +1,259 @@
+package com.motion.scrap
+
+import android.annotation.SuppressLint
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.media.*
+import android.os.*
+import android.view.Surface
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.system.measureTimeMillis
+
+class VideoTranscoder() {
+
+    constructor(builder: Builder) : this() {
+        this.isUseDecoderCallback = builder.isUseDecoderCallback
+        this.isUseEncoderCallback = builder.isUseEncoderCallback
+    }
+
+    // region Members
+    private val countingLatch = CountingLatch.downOf(0)
+    private lateinit var converter: Operator
+
+    private lateinit var imageWriter: ImageWriter
+    private lateinit var imageReader: ImageReader
+    private var _imageReceiveThread: HandlerThread? = null
+    private val imageReceiveThread get() = _imageReceiveThread!!
+
+    private var isUseDecoderCallback = true
+    private var isUseEncoderCallback = true
+    private var numProcessFrames = 0
+    private lateinit var sendEOSHint: (Int, Long) -> Unit
+    private var eventListener: EventListener? = null
+
+    companion object {
+        private val TAG = "VideoTranscoder"
+        private const val MAX_TRANSCODING_IMAGES = 16
+        private const val TRANSCODE_CODEC_PRIORITY = 1
+        private const val CODEC_POOLING_DURATION_US = 100L
+        private val MAX_QUEUED_INPUT by lazy { 4 }
+
+        private const val ALIGN_MOD = 2
+        private const val EPS = 1e-4f
+    }
+
+    // endregion
+
+    class Builder {
+        internal var isUseDecoderCallback = true
+        internal var isUseEncoderCallback = true
+        fun useDecoderCallback(flag: Boolean) = apply { isUseDecoderCallback = flag }
+        fun useEncoderCallback(flag: Boolean) = apply { isUseEncoderCallback = flag }
+        fun build() = VideoTranscoder(this)
+    }
+
+    // region Helpers ----------------------------------------------------------
+
+    private fun Int.alignDown(mod: Int = ALIGN_MOD): Int {
+        val r = this % mod
+        return this - r
+    }
+
+    private fun Int.alignUp(mod: Int = ALIGN_MOD): Int {
+        val r = this % mod
+        return if (r == 0) this else this + (mod - r)
+    }
+
+    private fun Float.nearlyEquals(other: Float, eps: Float = EPS) = abs(this - other) <= eps
+
+    private fun ratioOf(w: Int, h: Int): Float = if (w == 0 || h == 0) 0f else w.toFloat() / h
+
+    private fun computeTargetDimsAfterRotation(task: VideoTranscodingTask): Pair<Int, Int> {
+        val dstW = task.getTranscodingVideoWidth()
+        val dstH = task.getTranscodingVideoHeight()
+        val dstRot = task.getTranscodingRotation()
+        return if (dstRot % 180 != 0) dstH to dstW else dstW to dstH
+    }
+
+    private fun getCorrectionRotation(src: Int, dst: Int): Int {
+        var correction = src - dst
+        if (correction < 0) correction += 360
+        return correction
+    }
+
+    // endregion
+
+    // region Crop -------------------------------------------------------------
+
+    private fun computeCropRect(inFormat: SumMediaFormat, targetW: Int, targetH: Int): Rect {
+        val w = targetW.coerceAtMost(inFormat.cols).alignDown()
+        val h = targetH.coerceAtMost(inFormat.rows).alignDown()
+        val maxX = (inFormat.cols - w).coerceAtLeast(0)
+        val maxY = (inFormat.rows - h).coerceAtLeast(0)
+        var x = ((inFormat.cols - w) / 2).coerceIn(0, maxX).alignDown()
+        var y = ((inFormat.rows - h) / 2).coerceIn(0, maxY).alignDown()
+        return Rect(x, y, x + w, y + h)
+    }
+
+    // endregion
+
+    // region Main converter ---------------------------------------------------
+
+    private fun makeConverter(task: VideoTranscodingTask): Operator {
+        val srcRot = task.getRotation()
+        val dstRot = task.getTranscodingRotation()
+        val needRotate = srcRot != dstRot
+
+        val srcW0 = task.getVideoWidth()
+        val srcH0 = task.getVideoHeight()
+        val (srcWAfterRot, srcHAfterRot) = if (srcRot % 180 != 0) srcH0 to srcW0 else srcW0 to srcH0
+        val (tgtWAfterRot, tgtHAfterRot) = computeTargetDimsAfterRotation(task)
+
+        val sW = tgtWAfterRot.toFloat() / srcWAfterRot
+        val sH = tgtHAfterRot.toFloat() / srcHAfterRot
+        val scale = max(sW, sH)
+
+        val needResize = !scale.nearlyEquals(1f)
+        val needCrop = !ratioOf(srcWAfterRot, srcHAfterRot)
+            .nearlyEquals(ratioOf(tgtWAfterRot, tgtHAfterRot))
+
+        val steps = mutableListOf<ImgpConverter>()
+        if (srcRot == 90 || srcRot == 270) {
+            if (needRotate) steps += ImgpConverter(UniImgp.ofRotate())
+            if (needResize) steps += ImgpConverter(UniImgp.ofResize())
+        } else {
+            if (needResize) steps += ImgpConverter(UniImgp.ofResize())
+            if (needRotate) steps += ImgpConverter(UniImgp.ofRotate())
+        }
+        if (needCrop) steps += ImgpConverter(UniImgp.ofCrop())
+
+        return Operator { ibuf, obuf ->
+            var input = ibuf
+            var output = obuf
+
+            for (stage in steps) {
+                val last = stage == steps.last()
+                output = when (stage.imgpType) {
+                    ImgpType.ROTATE -> {
+                        val rot = getCorrectionRotation(srcRot, dstRot)
+                        val swapWH = rot == 90 || rot == 270
+                        MediaBuffer.newImageAlloc().apply {
+                            val newFmt = input.format.toMutableFormat().apply {
+                                cols = if (swapWH) input.format.rows.alignDown() else input.format.cols.alignDown()
+                                rows = if (swapWH) input.format.cols.alignDown() else input.format.rows.alignDown()
+                                setRotation(rot)
+                            }
+                            setMediaFormat(newFmt)
+                            if (last && obuf.isNotEmpty) setData(obuf.getData())
+                            else {
+                                asSharable()
+                                setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                            }
+                        }.allocateMutable()
+                    }
+                    ImgpType.RESIZE -> {
+                        MediaBuffer.newImageAlloc().apply {
+                            val newFmt = input.format.toMutableFormat().apply {
+                                cols = (input.format.cols * scale).toInt().alignDown()
+                                rows = (input.format.rows * scale).toInt().alignDown()
+                            }
+                            setMediaFormat(newFmt)
+                            if (last && obuf.isNotEmpty) setData(obuf.getData())
+                            else {
+                                asSharable()
+                                setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                            }
+                        }.allocateMutable()
+                    }
+                    ImgpType.CROP -> {
+                        MediaBuffer.newImageAlloc().apply {
+                            val crop = computeCropRect(input.format, tgtWAfterRot, tgtHAfterRot)
+                            val newFmt = input.format.toMutableFormat()
+                                .setCropRect(crop)
+                                .apply {
+                                    cols = (crop.right - crop.left).alignDown()
+                                    rows = (crop.bottom - crop.top).alignDown()
+                                }
+                            setMediaFormat(newFmt)
+                            if (last && obuf.isNotEmpty) setData(obuf.getData())
+                            else {
+                                asSharable()
+                                setUsage(obuf.getTypedData(HardwareBuffer::class.java).usage)
+                            }
+                        }.allocateMutable()
+                    }
+                    else -> throw UnsupportedOperationException("Unsupported: ${stage.imgpType}")
+                }
+
+                input = stage.run(input, output)
+            }
+            output
+        }
+    }
+
+    // endregion
+
+    // region prepareEncoder ---------------------------------------------------
+
+    private fun prepareEncoder(
+        task: VideoTranscodingTask,
+        extractor: MediaExtractor,
+        trackIndex: Int
+    ): MediaCodec {
+        val format = task.getVideoCodecFormat()
+        val mime = format.getString(MediaFormat.KEY_MIME)!!
+        configVideoEncoderParameters(format, task)
+
+        val encoder = MediaCodec.createEncoderByType(task.getVideoCodecType().value)
+
+        val encoderSurface = encoder.createInputSurface()
+        imageWriter = ImageWriter.newInstance(encoderSurface, MAX_TRANSCODING_IMAGES)
+        SharedBufferManager.setSurfaceAsDroppable(encoderSurface, false)
+
+        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        return encoder
+    }
+
+    private fun configVideoEncoderParameters(format: MediaFormat, task: VideoTranscodingTask) {
+        format.setInteger(MediaFormat.KEY_WIDTH, task.getTranscodingVideoWidth())
+        format.setInteger(MediaFormat.KEY_HEIGHT, task.getTranscodingVideoHeight())
+        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+        format.setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, 0.5f)
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 10_000_000)
+        format.setInteger(MediaFormat.KEY_PRIORITY, TRANSCODE_CODEC_PRIORITY)
+    }
+
+    // endregion
+
+    // region decode callback --------------------------------------------------
+
+    @OptIn(ExperimentalStdlibApi::class)
+    private fun onDecodedImageAvailable(reader: ImageReader) {
+        try {
+            val srcImage = reader.acquireNextImage() ?: return
+            val dstImage = imageWriter.dequeueInputImage()
+
+            measureTimeMillis {
+                converter.run(MediaBuffer.of(srcImage), MediaBuffer.of(dstImage))
+            }
+
+            dstImage.timestamp = srcImage.timestamp
+            dstImage.dataSpace = srcImage.dataSpace
+            srcImage.close()
+
+            numProcessFrames++
+            imageWriter.queueInputImage(dstImage)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    // endregion
+
+    fun setOnEventListener(eventListener: EventListener) {
+        this.eventListener = eventListener
+    }
+}
