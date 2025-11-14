@@ -1,0 +1,308 @@
+Issue is very likely **not** in Imgp/resize, mà ở chỗ em đang tính `minLastTimestampUs` sai vì có **image track** trong MP4.
+
+Khi file có track `image/...` (micro video / motion photo) + video `video/avc` + audio `audio/...`:
+
+```kotlin
+val minLastTimestampUs = (0 until extractor.trackCount).minOfOrNull {
+    val mimeType = extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!
+    task.mpFile.getDistinctLastTimestampUs(mimeType)
+} ?: 0L
+```
+
+Nếu `getDistinctLastTimestampUs("image/...")` trả về **0**, thì `minOfOrNull` = 0 →
+
+* `processAudio` dừng **ngay lập tức** → **không có audio sample** → mất audio.
+* Decoder/encoder dùng `minLastTimestampUs = 0` để gửi EOS hint → pipeline kết thúc sớm → video bị **nhiễu / rác** ở đoạn cuối, vì encoder tưởng đã tới EOS.
+
+### Fix design
+
+1. **Chỉ tính `minLastTimestampUs` trên các track audio/video**, bỏ qua `image/*`.
+2. Nếu sau khi lọc mà vẫn = 0, coi như **không trim theo timestamp** (dùng full stream).
+
+---
+
+## 1. Thêm helper tính `lastTimestampUs` đúng
+
+```kotlin
+private fun findMinLastTimestampUs(
+    task: VideoTranscodingTask,
+    extractor: MediaExtractor
+): Long {
+    val allMimes = (0 until extractor.trackCount).map {
+        extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!
+    }
+
+    val avMimes = allMimes.filter { it.startsWith("video/") || it.startsWith("audio/") }
+
+    val minTs = avMimes.minOfOrNull { mime ->
+        task.mpFile.getDistinctLastTimestampUs(mime)
+    } ?: 0L
+
+    SLog.i(TAG, "findMinLastTimestampUs: allMimes=$allMimes, avMimes=$avMimes, minTs=$minTs")
+    return minTs
+}
+```
+
+---
+
+## 2. Sửa `processAudio`
+
+Thay khối tính `minLastTimestampUs` và điều kiện break:
+
+```kotlin
+@SuppressLint("WrongConstant")
+private fun processAudio(task: VideoTranscodingTask, extractor: MediaExtractor, trackIndex: Int) {
+    SLog.i(TAG, "processAudio")
+    val format = task.getAudioCodecFormat()
+    val maxInputSize = format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+    val buf = ByteBuffer.allocateDirect(maxInputSize)
+    val samples = mutableListOf<Pair<ByteBuffer, MediaCodec.BufferInfo>>()
+
+    require(task.getTranscodingAudioCodecType() == task.getAudioCodecType()) {
+        """currently support only same audio codec type, but given file requires conversion from 
+            | ${task.getAudioCodecType()} to ${task.getTranscodingAudioCodecType()}
+        """.trimToOneLine()
+    }
+
+    val minLastTimestampUs = findMinLastTimestampUs(task, extractor)
+    SLog.i(TAG, "audio minLastTimestampUs=$minLastTimestampUs")
+
+    extractor.selectTrack(trackIndex)
+
+    while (true) {
+        val readBytes = extractor.readSampleData(buf, 0)
+        buf.rewind()
+
+        // nếu minLastTimestampUs == 0L thì không cut theo timestamp
+        if (readBytes < 0 || (minLastTimestampUs > 0 && extractor.sampleTime >= minLastTimestampUs)) {
+            SLog.i(TAG, """reached audio EOS: 
+                | durationMs=${task.getDistinctDurationMs()},
+                | minLastTimestampUs=$minLastTimestampUs
+            """.trimToOneLine())
+            break
+        }
+
+        val bufferInfo = MediaCodec.BufferInfo().apply {
+            size = buf.limit()
+            offset = 0
+            flags = extractor.sampleFlags
+            presentationTimeUs = extractor.sampleTime
+        }
+
+        SLog.d(TAG, "store audio sample: info=${bufferInfo.asString()}")
+
+        val copy = ByteBuffer.allocateDirect(buf.limit()).apply { put(buf) }
+        copy.flip()
+        samples += copy to bufferInfo
+
+        extractor.advance()
+    }
+
+    extractor.unselectTrack(trackIndex)
+    task.addSamples(format.getString(MediaFormat.KEY_MIME)!!, samples.toList())
+    countingLatch.down()
+}
+```
+
+---
+
+## 3. Sửa `prepareEncoder` & `prepareDecoder`
+
+### `prepareEncoder`
+
+```kotlin
+private fun prepareEncoder(
+    task: VideoTranscodingTask,
+    extractor: MediaExtractor,
+    trackIndex: Int
+): MediaCodec {
+    SLog.i(TAG, "prepareEncoder E")
+    val format = task.getTranscodingVideoCodecFormat()
+    val mimeType = task.getTranscodingVideoCodecType()
+    configVideoEncoderParameters(format, task)
+
+    SLog.i(TAG, "encoding-format: $format")
+
+    val encoder = MediaCodec.createEncoderByType(mimeType.value)
+
+    if (isUseEncoderCallback) {
+        val minLastTimestampUs = findMinLastTimestampUs(task, extractor)
+        SLog.i(TAG, "encoder minLastTimestampUs=$minLastTimestampUs")
+
+        val videoEncoderCallback = VideoEncoderCallback.Builder()
+            .setEOSTimestampUs(minLastTimestampUs)
+            .setOnReachedEOS {
+                task.addSamples(format.getString(MediaFormat.KEY_MIME)!!, it.toList())
+                countingLatch.down()
+                this@VideoTranscoder.eventListener?.onTranscodingComplete(task.mpFile)
+            }.setOnEachFrameDone {
+                this@VideoTranscoder.eventListener?.onEachFrameTranscoded(task.mpFile, mimeType.value, it)
+            }.build()
+
+        sendEOSHint = videoEncoderCallback::setEOSHint
+        encoder.setCallback(videoEncoderCallback)
+    }
+
+    encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+
+    imageWriter = ImageWriter.newInstance(
+        encoder.createInputSurface(),
+        MAX_TRANSCODING_IMAGES
+    )
+
+    SLog.i(TAG, "prepareEncoder X")
+    return encoder
+}
+```
+
+### `prepareDecoder`
+
+```kotlin
+private fun prepareDecoder(
+    task: VideoTranscodingTask,
+    extractor: MediaExtractor,
+    trackIndex: Int
+): MediaCodec {
+    SLog.i(TAG, "prepareDecoder E")
+    val format = task.getVideoCodecFormat()
+    configVideoDecoderParameters(format)
+
+    imageReader = ImageReader.newInstance(
+        task.getVideoWidth(),
+        task.getVideoHeight(),
+        ImageFormat.PRIVATE,
+        MAX_TRANSCODING_IMAGES
+    ).apply {
+        setOnImageAvailableListener(::onDecodedImageAvailable, Handler(imageReceiveThread.looper))
+    }
+
+    val decoder = MediaCodec.createDecoderByType(task.getVideoCodecType().value)
+
+    if (isUseDecoderCallback) {
+        val minLastTimestampUs = findMinLastTimestampUs(task, extractor)
+        SLog.i(TAG, "decoder minLastTimestampUs=$minLastTimestampUs")
+
+        val videoDecoderCallback = VideoDecoderCallback.Builder()
+            .setExtractor(extractor)
+            .setMediaFormat(format)
+            .setLastTimestampUs(minLastTimestampUs)
+            .setOnInputReachedEOS { extractor.unselectTrack(trackIndex) }
+            .setOnOutputReachedEOS { numFrames, lastTimestampUs ->
+                sendEOSHint(numFrames, lastTimestampUs)
+            }.build()
+
+        decoder.setCallback(videoDecoderCallback)
+    }
+
+    SLog.i(TAG, "decode-format: $format")
+    decoder.configure(format, imageReader.surface, null, 0)
+
+    setBoostMode(decoder)
+
+    SLog.i(TAG, "prepareDecoder X")
+    return decoder
+}
+```
+
+---
+
+## 4. Sửa `executeDecoder` (nếu dùng path sync)
+
+Chỗ tính `minLastTimestampUs` cũng nên dùng helper + điều kiện `> 0`:
+
+```kotlin
+private fun executeDecoder(
+    task: VideoTranscodingTask,
+    decoder: MediaCodec,
+    extractor: MediaExtractor,
+    trackIndex: Int
+) {
+    SLog.i(TAG, "executeDecoder E")
+    val maxInputSize = task.getVideoCodecFormat().getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+
+    val minLastTimestampUs = findMinLastTimestampUs(task, extractor)
+    SLog.i(TAG, "executeDecoder minLastTimestampUs=$minLastTimestampUs")
+
+    var inputReachedEOS = false
+    var outputReachedEOS = false
+    var numFramesToDecode = 0
+    var numFramesDecoded = 0
+    var lastDecodedTimestampUs = 0L
+
+    while (!inputReachedEOS || !outputReachedEOS) {
+        if (!inputReachedEOS && numFramesToDecode <= MAX_QUEUED_INPUT) {
+            val bufferIdx = decoder.dequeueInputBuffer(CODEC_POOLING_DURATION_US)
+            if (bufferIdx < 0) {
+                SLog.w(TAG, "none decoder input buffer available")
+                continue
+            }
+
+            val srcBuf = ByteBuffer.allocateDirect(maxInputSize)
+            val readBytes = extractor.readSampleData(srcBuf, 0)
+            srcBuf.rewind()
+
+            val bufferInfo = MediaCodec.BufferInfo().apply {
+                size = if (readBytes > 0) readBytes else 0
+                offset = 0
+                presentationTimeUs = extractor.sampleTime
+
+                if ((extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                    flags = flags or MediaCodec.BUFFER_FLAG_KEY_FRAME
+                }
+
+                if (readBytes < 0 || (minLastTimestampUs > 0 && presentationTimeUs >= minLastTimestampUs)) {
+                    flags = flags or MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                }
+            }
+
+            when {
+                bufferInfo.containFlag(MediaCodec.BUFFER_FLAG_END_OF_STREAM) -> {
+                    SLog.i(TAG, "decoder input is reached EOS")
+                    decoder.queueInputBuffer(
+                        bufferIdx, 0,
+                        0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                    )
+
+                    inputReachedEOS = true
+                    extractor.unselectTrack(trackIndex)
+                }
+                else -> {
+                    val dstBuf = decoder.getInputBuffer(bufferIdx)!!
+                    dstBuf.put(srcBuf)
+                    dstBuf.flip()
+
+                    decoder.queueInputBuffer(
+                        bufferIdx, 0, dstBuf.limit(),
+                        bufferInfo.presentationTimeUs, bufferInfo.flags)
+                    ++numFramesToDecode
+                }
+            }
+            // log ...
+        }
+
+        // phần output giữ nguyên, chỉ log thêm minLastTimestampUs nếu cần
+        ...
+    }
+
+    sendEOSHint(numFramesDecoded, lastDecodedTimestampUs)
+
+    SLog.i(TAG, """executeDecoder X: 
+        | numFramesDecoded=$numFramesDecoded,
+        | lastDecodedTimestampUs=$lastDecodedTimestampUs us,
+        | minLastTimestampUs=$minLastTimestampUs
+    """.trimToOneLine())
+}
+```
+
+---
+
+### Tóm tắt root cause & hiệu ứng
+
+* **Root cause:** Tính EOS threshold (`minLastTimestampUs`) trên **cả image track**, làm giá trị bị 0 → mọi chỗ dùng giá trị này (audio reuse + decoder/encoder EOS) đều dừng **quá sớm**.
+* **Symptom:**
+
+  * Audio path đọc được 0 sample → muxer chỉ có video → nghe như **mất audio**.
+  * Video path gửi EOSHint sai → encoder dừng khi buffer chưa flush hết → frame cuối bị lỗi / nhiễu.
+* **Fix:** Lọc chỉ `mime` bắt đầu bằng `"video/"` hoặc `"audio/"`, và chỉ cắt theo timestamp nếu `minLastTimestampUs > 0`.
+
+Em áp dụng mấy chỗ `minLastTimestampUs` trong file này, build lại, test lại case *image mime + video/avc + audio* thì video sẽ hết nhiễu và audio sẽ có lại.
