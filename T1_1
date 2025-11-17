@@ -1,0 +1,525 @@
+Short version: your encoder is being told **“you only have ~7 frames”**, so it happily stops after 7, even though the source has ~90. That comes from how you compute / propagate EOS *hints* between decoder and encoder, plus an EOS condition that’s too aggressive.
+
+Let’s walk through what the code actually does and where it goes wrong, then I’ll suggest concrete fixes.
+
+---
+
+## 1. How the pipeline is supposed to work
+
+### Decoder side (AVC → surface)
+
+`VideoDecoderCallback`:
+
+* Feeds compressed samples from `MediaExtractor` into the decoder.
+* Stops feeding (sets EOS) when:
+
+  ```kotlin
+  if (!extractor.advance() || presentationTimeUs >= lastTimestampUs) {
+      flags = flags or MediaCodec.BUFFER_FLAG_END_OF_STREAM
+  }
+  ```
+* Counts decoded frames in `numFramesDecoded`.
+* When it sees EOS on output:
+
+  ```kotlin
+  onOutputReachedEOS?.invoke(numFramesDecoded, lastDecodedTimestampUs)
+  ```
+
+So the *intent* is:
+
+> “I decoded **numFramesDecoded** frames, last PTS = **lastDecodedTimestampUs**. Encoder, please expect that many frames / this duration.”
+
+### Encoder side (HEVC from surface)
+
+`VideoEncoderCallback`:
+
+* Keeps a running count:
+
+  ```kotlin
+  private var numFramesEncoded = 0
+  private var numFramesToEncode = Int.MAX_VALUE
+  private var lastTimestampUs = Long.MAX_VALUE
+  ```
+* Hints come from decoder via:
+
+  ```kotlin
+  fun setEOSHint(numFramesToEncode: Int, lastTimestampUs: Long) {
+      SLog.i(TAG, "setEOSHint: numFramesToEncode=$numFramesToEncode, lastTimestampUs=$lastTimestampUs")
+      this.numFramesToEncode = numFramesToEncode
+
+      if (lastTimestampUs < this.lastTimestampUs) {
+          this.lastTimestampUs = lastTimestampUs
+      }
+  }
+  ```
+* On each output:
+
+  ```kotlin
+  if (!info.containFlag(MediaCodec.BUFFER_FLAG_CODEC_CONFIG)) {
+      numFramesEncoded++
+  }
+  ...
+  if (numFramesEncoded >= numFramesToEncode || info.presentationTimeUs >= lastTimestampUs) {
+      // treat as EOS
+      onReachedEOS?.invoke(samples)
+  }
+  ```
+
+So encoder **does not rely on BUFFER_FLAG_END_OF_STREAM**, it just says:
+
+> “If I reached the expected frame count **OR** passed the EOS timestamp hint, I will treat this as EOS and stop.”
+
+---
+
+## 2. Why you only get 7 / 90 frames
+
+The behavior you described matches this:
+
+* Decoder sends this hint (from your log):
+
+  ```text
+  setEOSHint numFramesToEncode=7, lastTimestampUs=2317000
+  ```
+* Meaning: `numFramesToEncode = 7`.
+* Encoder EOS condition:
+
+  ```kotlin
+  if (numFramesEncoded >= numFramesToEncode || info.presentationTimeUs >= lastTimestampUs)
+  ```
+* On the 7th encoded frame:
+
+  * `numFramesEncoded == 7`
+  * `numFramesToEncode == 7`
+  * So `numFramesEncoded >= numFramesToEncode` is already **true**.
+  * The `||` means it **doesn’t care** about timestamp yet.
+* Result: encoder calls `onReachedEOS` after 7 frames and stops collecting samples, even though decoder / surface are still happily producing the rest (~90).
+
+So the *immediate* reason you see **7/90** is:
+
+> **EOS condition in `VideoEncoderCallback` uses `OR` with a wrong / too-small `numFramesToEncode` hint.**
+
+But why is `numFramesToEncode` = 7 instead of ~90?
+
+Because decoder told it so:
+
+```kotlin
+// VideoTranscoder.prepareDecoder()
+val videoDecoderCallback = VideoDecoderCallback.Builder()
+    ...
+    .setOnOutputReachedEOS { numFrames, lastTimestampUs ->
+        SLog.i(TAG, "decoder output is reached EOS: $numFrames, $lastTimestampUs")
+        sendEOSHint(numFrames, lastTimestampUs)
+    }.build()
+```
+
+So your decoder is hitting EOS after decoding only 7 frames. That’s almost always because of this line in `VideoDecoderCallback.onInputBufferAvailable`:
+
+```kotlin
+if (!extractor.advance() || presentationTimeUs >= lastTimestampUs) {
+    flags = flags or MediaCodec.BUFFER_FLAG_END_OF_STREAM
+}
+```
+
+And `lastTimestampUs` is computed in `prepareDecoder` as:
+
+```kotlin
+val minLastTimestampUs = (0 until extractor.trackCount).maxOfOrNull {
+    val mimeType = extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!
+    task.mpFile.getDistinctLastTimestampUs(mimeType)
+} ?: 0L
+...
+.setLastTimestampUs(minLastTimestampUs)
+```
+
+Problems here:
+
+1. The variable is called `minLastTimestampUs` but uses **`maxOfOrNull`** (naming mismatch, easy to create confusion).
+2. More importantly: if any `getDistinctLastTimestampUs(mimeType)` returns a **too small** value (e.g. because of wrong distinct duration, wrong track, or metadata bug), then `lastTimestampUs` is earlier than real video end.
+3. That makes `presentationTimeUs >= lastTimestampUs` become `true` very early ⇒ decoder feeds EOS after only a few frames ⇒ `numFramesDecoded` is small (7) ⇒ encoder gets hint `numFramesToEncode = 7` ⇒ EOS after 7 frames.
+
+So the chain is:
+
+> **Wrong lastTimestampUs ⇒ decoder stops early ⇒ wrong EOS hint ⇒ encoder stops at 7 frames.**
+
+---
+
+## 3. Concrete fixes
+
+### 3.1. Make decoder & encoder use the same EOS timestamp logic
+
+You already have a helper in `VideoTranscoder`:
+
+```kotlin
+private fun findMinLastTimestampUs(
+    task: VideoTranscodingTask,
+    extractor: MediaExtractor
+): Long {
+    val allMimes = (0 until extractor.trackCount).map {
+        extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!
+    }
+
+    val avMimes = allMimes.filter { it.startsWith("video/") || it.startsWith("audio/") }
+
+    val minTs = avMimes.minOfOrNull { mime ->
+        task.mpFile.getDistinctLastTimestampUs(mime)
+    } ?: 0L
+
+    SLog.i(TAG, "findMinLastTimestampUs: allMimes=$allMimes, avMimes=$avMimes, minTs=$minTs")
+    return minTs
+}
+```
+
+**Use this consistently**:
+
+**Before (in `prepareDecoder`)**:
+
+```kotlin
+val minLastTimestampUs = (0 until extractor.trackCount).maxOfOrNull {
+    val mimeType = extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!
+    task.mpFile.getDistinctLastTimestampUs(mimeType)
+} ?: 0L
+
+val videoDecoderCallback = VideoDecoderCallback.Builder()
+    ...
+    .setLastTimestampUs(minLastTimestampUs)
+```
+
+**After:**
+
+```kotlin
+val lastTimestampUs = findMinLastTimestampUs(task, extractor)
+SLog.i(TAG, "decoder lastTimestampUs (min av) = $lastTimestampUs")
+
+val videoDecoderCallback = VideoDecoderCallback.Builder()
+    ...
+    .setLastTimestampUs(lastTimestampUs)
+```
+
+Now decoder and encoder both use **min AV last timestamp**, not two different computations (one min, one max).
+
+Also, be defensive in decoder if `lastTimestampUs == 0`:
+
+```kotlin
+if (!extractor.advance() || (lastTimestampUs > 0 && presentationTimeUs >= lastTimestampUs)) {
+    ...
+}
+```
+
+This avoids killing the stream immediately if metadata is broken and returns 0.
+
+---
+
+### 3.2. Fix `setEOSHint` in `VideoEncoderCallback`
+
+Currently:
+
+```kotlin
+fun setEOSHint(numFramesToEncode: Int, lastTimestampUs: Long) {
+    this.numFramesToEncode = numFramesToEncode
+
+    if (lastTimestampUs < this.lastTimestampUs) {
+        this.lastTimestampUs = lastTimestampUs
+    }
+}
+```
+
+This keeps the **minimum** of all timestamps ever seen. But your builder already sets:
+
+```kotlin
+lastTimestampUs = builder.eosTimestampUs   // from prepareEncoder, min of tracks
+```
+
+Then decoder might pass a *larger* `lastDecodedTimestampUs`. With the current `<` comparison, you **ignore** the correct (larger) value and keep the smaller one. That can make the timestamp threshold too early.
+
+For the async decoder path, you actually want to trust the decoder output EOS more than the initial min guess.
+
+**Change it to this:**
+
+```kotlin
+fun setEOSHint(numFramesToEncode: Int, lastTimestampUs: Long) {
+    SLog.i(TAG, "setEOSHint: numFramesToEncode=$numFramesToEncode, lastTimestampUs=$lastTimestampUs, oldLastTs=$this.lastTimestampUs")
+    this.numFramesToEncode = numFramesToEncode
+    // decoder knows real last decoded PTS, just overwrite
+    this.lastTimestampUs = lastTimestampUs
+}
+```
+
+If you still want a safety net:
+
+```kotlin
+this.lastTimestampUs = if (this.lastTimestampUs == Long.MAX_VALUE) {
+    lastTimestampUs
+} else {
+    max(this.lastTimestampUs, lastTimestampUs)
+}
+```
+
+---
+
+### 3.3. Make EOS condition in encoder less aggressive
+
+This is the one that makes you stop bang on 7 frames when the hint is wrong:
+
+```kotlin
+if (numFramesEncoded >= numFramesToEncode || info.presentationTimeUs >= lastTimestampUs) {
+    onReachedEOS?.invoke(samples)
+}
+```
+
+With a bad `numFramesToEncode` (7), you instantly hit EOS; timestamps never get a chance to help.
+
+Two safer options:
+
+#### Option A – Require *both* conditions (AND)
+
+```kotlin
+if (numFramesEncoded >= numFramesToEncode &&
+    info.presentationTimeUs >= lastTimestampUs) {
+    ...
+}
+```
+
+This way, even if `numFramesToEncode` is accidentally small, you’ll still encode until at least the EOS timestamp.
+
+#### Option B – Prefer timestamp, ignore frame count for EOS
+
+Since timestamps come from the original bitstream and are generally more reliable:
+
+```kotlin
+// use frame count only for debugging / sanity logging:
+SLog.d(TAG, "encoded $numFramesEncoded / $numFramesToEncode, pts=${info.presentationTimeUs} / $lastTimestampUs")
+
+if (info.presentationTimeUs >= lastTimestampUs) {
+    ...
+}
+```
+
+If your `getDistinctLastTimestampUs()` is correct, this is usually enough.
+
+---
+
+## 4. Sanity checks to confirm fix
+
+After applying the changes:
+
+1. Add logs in **decoder EOS callback**:
+
+   ```kotlin
+   .setOnOutputReachedEOS { numFrames, lastTimestampUs ->
+       SLog.i(TAG, "DEC EOS: numFrames=$numFrames, lastTs=$lastTimestampUs")
+       sendEOSHint(numFrames, lastTimestampUs)
+   }
+   ```
+
+   You should see something like `numFrames=90` instead of `7`.
+
+2. Add logs in **encoder callback**:
+
+   ```kotlin
+   SLog.i(TAG, "ENC OUT: encoded=$numFramesEncoded/$numFramesToEncode, pts=${info.presentationTimeUs}, lastTs=$lastTimestampUs")
+   ```
+
+3. Expected behavior:
+
+   * Decoder log shows **~90** frames at EOS.
+   * Encoder keeps encoding until:
+
+     * Either `numFramesEncoded` also reaches ~90, and
+     * Or PTS reaches around the same `lastTimestampUs`.
+   * No early `onReachedEOS` at 7 frames.
+
+---
+
+## TL;DR
+
+* The reason you only transcode **7/90 frames** is:
+
+  * Decoder hits EOS early (wrong `lastTimestampUs`), so it tells encoder “only 7 frames.”
+  * Encoder EOS condition uses `numFramesEncoded >= numFramesToEncode` (with `||`), so it stops exactly at 7.
+* Fixes:
+
+  1. Use the same **min AV last timestamp** for decoder & encoder (`findMinLastTimestampUs`).
+  2. In `setEOSHint`, **overwrite** `lastTimestampUs` with decoder’s EOS timestamp instead of taking the min.
+  3. Loosen encoder EOS condition (`&&` instead of `||`, or rely mainly on timestamp).
+
+If you want, you can paste your actual logs (input PTS, `getDistinctLastTimestampUs` values) and I can double-check the numbers and suggest which EOS strategy (AND vs timestamp-only) fits best for your clips.
+
+
+Below is a **complete, ready-to-run JUnit test** that:
+
+✔ Opens an MP4 file
+✔ Extracts **video frame timestamps**
+✔ Extracts **audio frame timestamps**
+✔ Prints every timestamp in microseconds (µs)
+✔ Prints frame index, size, flags (KEY_FRAME, CONFIG, EOS)
+✔ Works on Android (JUnit + Instrumented Test)
+✔ Pure extractor-based, no decoder needed
+
+You can copy-paste this into your module’s `androidTest` package.
+
+---
+
+# ✅ **JUnit Test: Log All Video & Audio Timestamps**
+
+```kotlin
+package com.example.mediatest
+
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaCodec
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import org.junit.Test
+import org.junit.runner.RunWith
+import android.util.Log
+import java.nio.ByteBuffer
+
+@RunWith(AndroidJUnit4::class)
+class TimestampDumpTest {
+
+    companion object {
+        private const val TAG = "TimestampDumpTest"
+    }
+
+    @Test
+    fun dumpAllTimestamps() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+
+        // TODO: put your test.mp4 in:  src/androidTest/assets/test.mp4
+        val afd = context.assets.openFd("test.mp4")
+
+        val extractor = MediaExtractor()
+        extractor.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+
+        val trackCount = extractor.trackCount
+        Log.i(TAG, "Track count = $trackCount")
+
+        var videoTrack = -1
+        var audioTrack = -1
+
+        for (i in 0 until trackCount) {
+            val fmt = extractor.getTrackFormat(i)
+            val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+
+            if (mime.startsWith("video/")) {
+                videoTrack = i
+                Log.i(TAG, "Found video track: $i, mime=$mime")
+            } else if (mime.startsWith("audio/")) {
+                audioTrack = i
+                Log.i(TAG, "Found audio track: $i, mime=$mime")
+            }
+        }
+
+        if (videoTrack < 0) Log.w(TAG, "No video track!")
+        if (audioTrack < 0) Log.w(TAG, "No audio track!")
+
+        if (videoTrack >= 0) dumpTrack(extractor, videoTrack, "VIDEO")
+        if (audioTrack >= 0) dumpTrack(extractor, audioTrack, "AUDIO")
+
+        extractor.release()
+    }
+
+    private fun dumpTrack(
+        extractor: MediaExtractor,
+        trackIndex: Int,
+        label: String
+    ) {
+        extractor.unselectTrack(0)
+        extractor.unselectTrack(1)
+        extractor.selectTrack(trackIndex)
+
+        var frameIndex = 0
+
+        val buffer = ByteBuffer.allocate(512 * 1024)
+        val info = MediaCodec.BufferInfo()
+
+        Log.i(TAG, "========================= $label timestamps =========================")
+
+        while (true) {
+            val sampleSize = extractor.readSampleData(buffer, 0)
+            if (sampleSize < 0) {
+                Log.i(TAG, "$label: <EOS>")
+                break
+            }
+
+            info.size = sampleSize
+            info.presentationTimeUs = extractor.sampleTime
+            info.flags = extractor.sampleFlags
+
+            Log.i(
+                TAG,
+                "$label frame=$frameIndex  pts=${info.presentationTimeUs}us  " +
+                        "size=${info.size}  flags=${flagString(info.flags)}"
+            )
+
+            extractor.advance()
+            frameIndex++
+        }
+    }
+
+    private fun flagString(flags: Int): String {
+        val list = mutableListOf<String>()
+        if (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) list.add("KEY")
+        if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) list.add("CONFIG")
+        if (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) list.add("EOS")
+        return list.joinToString("|").ifEmpty { "NONE" }
+    }
+}
+```
+
+---
+
+# 📌 **How to use**
+
+### 1. Create asset:
+
+Copy your video:
+
+```
+app/src/androidTest/assets/test.mp4
+```
+
+### 2. Run test:
+
+Android Studio →
+**Run > Run ‘TimestampDumpTest’**
+
+### 3. Output example:
+
+```
+I/TimestampDumpTest: Found video track: 0, mime=video/avc
+I/TimestampDumpTest: Found audio track: 1, mime=audio/mp4a-latm
+
+========================= VIDEO timestamps =========================
+VIDEO frame=0 pts=0 size=18290 flags=KEY
+VIDEO frame=1 pts=33333 size=4022 flags=NONE
+VIDEO frame=2 pts=66666 size=3502 flags=NONE
+...
+VIDEO: <EOS>
+
+========================= AUDIO timestamps =========================
+AUDIO frame=0 pts=0 size=2048 flags=NONE
+AUDIO frame=1 pts=23219 size=2048 flags=NONE
+AUDIO frame=2 pts=46439 size=2048 flags=NONE
+...
+AUDIO: <EOS>
+```
+
+---
+
+# 💡 Extra options you might want
+
+If you need:
+
+✔ Dump only video
+✔ Dump only audio
+✔ Export timestamps to CSV
+✔ Compare video/audio drift
+✔ Detect missing or reversed PTS
+✔ Pretty print timeline
+
+Tell me and I’ll generate the extended version.
+
+---
+
+If you want, I can also write a **native C++ version using MediaExtractor NDK** or a **Kotlin command-line JVM version (using mp4parser)**.
