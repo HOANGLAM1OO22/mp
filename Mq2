@@ -1,0 +1,148 @@
+class VideoDecoderCallback(
+    private val extractor: MediaExtractor,
+    format: MediaFormat
+) : MediaCodec.Callback() {
+
+    constructor(builder: Builder) : this(builder.extractor, builder.mediaFormat) {
+        onOutputReachedEOS = builder.onOutputReachedEOS
+        SLog.i(TAG, "lastTimestampUs (ignored in async mode): ${builder.lastTimestampUs}")
+    }
+
+    private val extractorLock = Any()
+
+    private var onInputReachedEOS: OnDecoderInputReachedEOS? = null
+    private var onOutputReachedEOS: OnDecoderOutputReachedEOS? = null
+
+    private val maxInputSize =
+        min(MP_MAX_BITSTREAM_SIZE, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+
+    private var numFramesToDecode = 0
+    private var numFramesDecoded = 0
+    private var lastDecodedTimestampUs = 0L
+
+    private var eosInputSent = false
+    private var lastValidPts = 0L
+
+    override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
+        SLog.e(TAG, "Decoder error", e)
+    }
+
+    @SuppressLint("WrongConstant")
+    override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
+
+        synchronized(extractorLock) {
+
+            if (eosInputSent) return
+
+            val dst = codec.getInputBuffer(index)!!
+            dst.clear()
+
+            val sampleSize = extractor.readSampleData(dst, 0)
+
+            if (sampleSize < 0) {
+                // EOF – send EOS once
+                SLog.i(TAG, "decoder INPUT EOS (readSampleData < 0)")
+                codec.queueInputBuffer(
+                    index, 0, 0, lastValidPts, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                )
+                eosInputSent = true
+                onInputReachedEOS?.invoke()
+                return
+            }
+
+            val pts = extractor.sampleTime
+            val flags = extractor.sampleFlags
+
+            if (pts < 0) {
+                // DO NOT FEED INVALID FRAME
+                SLog.w(TAG, "Invalid pts = -1 → send EOS")
+                codec.queueInputBuffer(
+                    index, 0, 0, lastValidPts, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                )
+                eosInputSent = true
+                onInputReachedEOS?.invoke()
+                return
+            }
+
+            lastValidPts = pts
+
+            codec.queueInputBuffer(
+                index,
+                0,
+                sampleSize,
+                pts,
+                flags
+            )
+
+            extractor.advance()
+
+            numFramesToDecode++
+            SLog.i(TAG, "Input frame queued: pts=$pts size=$sampleSize totalIn=$numFramesToDecode")
+        }
+    }
+
+    override fun onOutputBufferAvailable(
+        codec: MediaCodec,
+        index: Int,
+        info: MediaCodec.BufferInfo
+    ) {
+        val eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+
+        if (info.size > 0) {
+            numFramesDecoded++
+            lastDecodedTimestampUs = info.presentationTimeUs
+            SLog.i(TAG, "Output frame: idx=$index pts=${info.presentationTimeUs} decoded=$numFramesDecoded")
+        }
+
+        codec.releaseOutputBuffer(index, true)
+
+        if (eos) {
+            SLog.i(TAG, "decoder OUTPUT EOS: frames=$numFramesDecoded lastPTS=$lastDecodedTimestampUs")
+            onOutputReachedEOS?.invoke(numFramesDecoded, lastDecodedTimestampUs)
+        }
+    }
+
+    override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+        SLog.i(TAG, "Decoder format changed: $format")
+    }
+
+    companion object {
+        private val TAG = SLog.tagOf(VideoDecoderCallback::class.java)
+        private const val MP_MAX_BITSTREAM_SIZE = 2_000_000
+    }
+
+    class Builder {
+        lateinit var extractor: MediaExtractor
+        lateinit var mediaFormat: MediaFormat
+        lateinit var onOutputReachedEOS: OnDecoderOutputReachedEOS
+        var lastTimestampUs: Long = 0L
+
+        private var onInputReachedEOS: OnDecoderInputReachedEOS? = null
+
+        fun setExtractor(extractor: MediaExtractor) = apply {
+            this.extractor = extractor
+        }
+
+        fun setMediaFormat(format: MediaFormat) = apply {
+            this.mediaFormat = format
+        }
+
+        fun setOnOutputReachedEOS(cb: OnDecoderOutputReachedEOS) = apply {
+            this.onOutputReachedEOS = cb
+        }
+
+        fun setOnInputReachedEOS(cb: OnDecoderInputReachedEOS) = apply {
+            this.onInputReachedEOS = cb
+        }
+
+        fun setLastTimestampUs(us: Long) = apply {
+            this.lastTimestampUs = us
+        }
+
+        fun build(): VideoDecoderCallback {
+            val c = VideoDecoderCallback(this)
+            c.onInputReachedEOS = onInputReachedEOS
+            return c
+        }
+    }
+}
