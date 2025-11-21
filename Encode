@@ -1,0 +1,124 @@
+@SuppressLint("WrongConstant")
+private fun encodingAudio(
+    task: VideoTranscodingTask,
+    extractor: MediaExtractor,
+    trackIndex: Int
+): Pair<MediaCodec?, MediaCodec?> {
+    SLog.i(TAG, "encodingAudio: source=audio/raw -> target=audio/mp4a-latm")
+
+    // input pcm format read from extractor
+    val srcFormat = extractor.getTrackFormat(trackIndex)
+    val maxInputSize = try {
+        srcFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+    } catch (e: Exception) {
+        // fallback to a reasonable default
+        256 * 1024
+    }
+
+    val pcmBuf = ByteBuffer.allocateDirect(maxInputSize)
+
+    // prepare target AAC format from task
+    val outFormat = task.getTranscodingAudioCodecFormat()
+    val sampleRate = outFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+    val channelCount = outFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+    val bitrate = outFormat.getInteger(MediaFormat.KEY_BIT_RATE)
+
+    val aacFormat = MediaFormat.createAudioFormat(MimeType.AUDIO_AAC.value, sampleRate, channelCount).apply {
+        setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+        setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+    }
+
+    SLog.i(TAG, "prepare AAC encoder format=$aacFormat")
+
+    val encoder = MediaCodec.createEncoderByType(MimeType.AUDIO_AAC.value)
+    encoder.configure(aacFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    encoder.start()
+
+    extractor.selectTrack(trackIndex)
+
+    val outputSamples = mutableListOf<Pair<ByteBuffer, MediaCodec.BufferInfo>>()
+
+    var inputEOS = false
+    var outputEOS = false
+
+    while (!outputEOS) {
+        // ---- input side: feed PCM to encoder ----
+        if (!inputEOS) {
+            val inIndex = encoder.dequeueInputBuffer(CODEC_POOLING_DURATION_US)
+            if (inIndex >= 0) {
+                val inBuf = encoder.getInputBuffer(inIndex)!!
+                inBuf.clear()
+
+                val read = extractor.readSampleData(pcmBuf, 0)
+                if (read < 0) {
+                    // push EOS to encoder
+                    encoder.queueInputBuffer(inIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                    inputEOS = true
+                    SLog.i(TAG, "encodingAudio: pushed input EOS")
+                } else {
+                    pcmBuf.limit(read)
+                    inBuf.put(pcmBuf)
+                    val pts = extractor.sampleTime
+                    val flags = extractor.sampleFlags
+                    encoder.queueInputBuffer(inIndex, 0, read, pts, flags)
+                    extractor.advance()
+                }
+            }
+        }
+
+        // ---- output side: pull AAC frames ----
+        val info = MediaCodec.BufferInfo()
+        val outIndex = encoder.dequeueOutputBuffer(info, CODEC_POOLING_DURATION_US)
+
+        when {
+            outIndex >= 0 -> {
+                val outBuf = encoder.getOutputBuffer(outIndex)!!
+                if (info.size > 0) {
+                    val encoded = ByteBuffer.allocateDirect(info.size).apply {
+                        put(outBuf)
+                        rewind()
+                    }
+                    // copy BufferInfo (to avoid reuse issues)
+                    val bi = MediaCodec.BufferInfo().apply {
+                        set(info.offset, info.size, info.presentationTimeUs, info.flags)
+                    }
+                    outputSamples += encoded to bi
+                    SLog.d(TAG, "encodingAudio: encoded size=${info.size}, pts=${info.presentationTimeUs}")
+                }
+                encoder.releaseOutputBuffer(outIndex, false)
+
+                if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                    outputEOS = true
+                    SLog.i(TAG, "encodingAudio: encoder output reached EOS")
+                }
+            }
+
+            outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                SLog.i(TAG, "encodingAudio: encoder output format changed: ${encoder.outputFormat}")
+            }
+
+            else -> {
+                // no-op (timed out)
+            }
+        }
+    }
+
+    extractor.unselectTrack(trackIndex)
+
+    // stop & keep encoder instance to return so caller may stop/release later if needed
+    encoder.stop()
+    encoder.release()
+
+    SLog.i(TAG, "encodingAudio: encoded frames=${outputSamples.size}")
+
+    // add encoded frames to task
+    if (outputSamples.isNotEmpty()) {
+        task.addSamples(MimeType.AUDIO_AAC.value, outputSamples)
+    }
+
+    // signal ready (same place existing code uses)
+    countingLatch.down()
+
+    // Return encoder as first element; second is null because this is encode-only path
+    return Pair(encoder, null)
+}
